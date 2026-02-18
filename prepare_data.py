@@ -52,16 +52,11 @@ def extract():
 
 def verify():
     expected = ["train.csv", "test.csv", "item_visual_emb_dim64.h5", "user_visual_emb_dim64.h5"]
-    # 解压后可能在 KuaiVideo_x1/ 或 KuaiVideo_x1 2/ 等目录
-    data_dir = None
-    for candidate in ["KuaiVideo_x1", "KuaiVideo_x1 2"]:
-        path = os.path.join(SAVE_DIR, candidate)
-        if os.path.isdir(path):
-            data_dir = path
-            break
+    # 解压后的数据目录
+    data_dir = os.path.join(SAVE_DIR, "KuaiVideo_x1")
 
-    if data_dir is None:
-        print("[warn] 未找到解压后的数据目录")
+    if not os.path.isdir(data_dir):
+        print("[warn] 未找到解压后的数据目录 KuaiVideo_x1/")
         return
 
     print(f"\n[verify] 数据目录: {data_dir}")

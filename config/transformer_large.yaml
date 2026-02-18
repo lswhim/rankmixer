@@ -11,7 +11,7 @@
 
 # --- 数据配置 ---
 data:
-  data_dir: "KuaiVideo_x1 2"
+  data_dir: "KuaiVideo_x1"
   train_file: "train.csv"
   test_file: "test.csv"
   user_emb_file: "user_visual_emb_dim64.h5"
