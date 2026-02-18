@@ -1,8 +1,9 @@
 """
 在 KuaiVideo_x1 数据集上进行 CTR 预测训练
-支持两种模型架构:
+支持三种模型架构:
   - RankMixer (arXiv:2507.15551)
   - TokenMixer-Large (arXiv:2602.06563)
+  - HSTU (arXiv:2402.17152)
 通过 config YAML 中的 model.arch 字段选择
 """
 
@@ -141,10 +142,12 @@ from rankmixer import (
 
 
 # ============================================================
-# RankMixer CTR 模型
+# CTR 模型基类 (公共: embedding + tokenization + proj)
 # ============================================================
 
-class RankMixerCTR(nn.Module):
+class BaseCTR(nn.Module):
+    """三个模型共用的 embedding → chunk → proj 流程"""
+
     def __init__(self, cfg):
         super().__init__()
         data_cfg = cfg["data"]
@@ -157,11 +160,6 @@ class RankMixerCTR(nn.Module):
         item_vis_dim = data_cfg["item_vis_dim"]
         chunk_size = model_cfg["chunk_size"]
         hidden_dim = model_cfg["hidden_dim"]
-        num_dense = model_cfg["num_dense_layers"]
-        num_moe = model_cfg["num_moe_layers"]
-        ffn_exp = model_cfg["ffn_expansion"]
-        num_experts = model_cfg["num_experts"]
-        l1_lambda = model_cfg["l1_lambda"]
 
         self.user_emb = nn.Embedding(data_cfg["num_users"], user_emb_dim)
         self.item_emb = nn.Embedding(data_cfg["item_hash_size"], item_emb_dim)
@@ -171,10 +169,42 @@ class RankMixerCTR(nn.Module):
         self.padded_dim = self.num_tokens * chunk_size
         self.chunk_size = chunk_size
         self.hidden_dim = hidden_dim
+        self.total_dim = total_dim
+
         self.proj = nn.Linear(chunk_size, hidden_dim)
 
+    def _tokenize(self, user_ids, item_ids, user_vis, item_vis):
+        """公共前处理: embedding → concat → pad → chunk → proj → [B, T, D]"""
+        u_emb = self.user_emb(user_ids)
+        i_emb = self.item_emb(item_ids)
+        e_input = torch.cat([u_emb, i_emb, user_vis, item_vis], dim=-1)
+
+        B = e_input.size(0)
+        if e_input.size(-1) < self.padded_dim:
+            e_input = F.pad(e_input, (0, self.padded_dim - e_input.size(-1)))
+
+        tokens = e_input.view(B, self.num_tokens, self.chunk_size)
+        return self.proj(tokens)  # [B, T, D]
+
+
+# ============================================================
+# RankMixer CTR 模型
+# ============================================================
+
+class RankMixerCTR(BaseCTR):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        model_cfg = cfg["model"]
         T = self.num_tokens
-        print(f"  [RankMixer] Feature dim: {total_dim}, Tokens (T): {T}, "
+        hidden_dim = self.hidden_dim
+
+        num_dense = model_cfg["num_dense_layers"]
+        num_moe = model_cfg["num_moe_layers"]
+        ffn_exp = model_cfg["ffn_expansion"]
+        num_experts = model_cfg["num_experts"]
+        l1_lambda = model_cfg["l1_lambda"]
+
+        print(f"  [RankMixer] Feature dim: {self.total_dim}, Tokens (T): {T}, "
               f"Hidden (D): {hidden_dim}, D/T: {hidden_dim // T}")
         print(f"  Dense layers: {num_dense}, MoE layers: {num_moe}, "
               f"Experts: {num_experts}, FFN expansion: {ffn_exp}")
@@ -192,16 +222,7 @@ class RankMixerCTR(nn.Module):
         )
 
     def forward(self, user_ids, item_ids, user_vis, item_vis):
-        u_emb = self.user_emb(user_ids)
-        i_emb = self.item_emb(item_ids)
-        e_input = torch.cat([u_emb, i_emb, user_vis, item_vis], dim=-1)
-
-        B = e_input.size(0)
-        if e_input.size(-1) < self.padded_dim:
-            e_input = F.pad(e_input, (0, self.padded_dim - e_input.size(-1)))
-
-        tokens = e_input.view(B, self.num_tokens, self.chunk_size)
-        x = self.proj(tokens)
+        x = self._tokenize(user_ids, item_ids, user_vis, item_vis)
 
         for blk in self.dense_blocks:
             x = blk(x)
@@ -220,38 +241,19 @@ class RankMixerCTR(nn.Module):
 # TokenMixer-Large CTR 模型 (arXiv:2602.06563)
 # ============================================================
 
-class TokenMixerLargeCTR(nn.Module):
+class TokenMixerLargeCTR(BaseCTR):
     def __init__(self, cfg):
-        super().__init__()
+        super().__init__(cfg)
         from tokenmixer_large import (
             TokenMixerLargeBlock, TokenMixerLargeMoEBlock, RMSNorm,
         )
 
-        data_cfg = cfg["data"]
-        emb_cfg = cfg["embedding"]
         model_cfg = cfg["model"]
-
-        user_emb_dim = emb_cfg["user_emb_dim"]
-        item_emb_dim = emb_cfg["item_emb_dim"]
-        user_vis_dim = data_cfg["user_vis_dim"]
-        item_vis_dim = data_cfg["item_vis_dim"]
-
-        chunk_size = model_cfg["chunk_size"]
-        hidden_dim = model_cfg["hidden_dim"]
-
-        self.user_emb = nn.Embedding(data_cfg["num_users"], user_emb_dim)
-        self.item_emb = nn.Embedding(data_cfg["item_hash_size"], item_emb_dim)
-
-        total_dim = user_emb_dim + item_emb_dim + user_vis_dim + item_vis_dim
-        self.num_tokens = math.ceil(total_dim / chunk_size)
-        self.padded_dim = self.num_tokens * chunk_size
-        self.chunk_size = chunk_size
-        self.hidden_dim = hidden_dim
-
         T = self.num_tokens
+        hidden_dim = self.hidden_dim
         T_global = T + 1
 
-        print(f"  [TokenMixer-Large] Feature dim: {total_dim}, Tokens (T): {T}, "
+        print(f"  [TokenMixer-Large] Feature dim: {self.total_dim}, Tokens (T): {T}, "
               f"+1 global = {T_global}")
         print(f"  Hidden (D): {hidden_dim}, D/(T+1): {hidden_dim // T_global}")
 
@@ -267,8 +269,6 @@ class TokenMixerLargeCTR(nn.Module):
         print(f"  Layers: {num_layers}, MoE: {use_moe}, "
               f"Experts: {model_cfg.get('num_experts', '-')}, "
               f"FFN expansion: {ffn_expansion}")
-
-        self.proj = nn.Linear(chunk_size, hidden_dim)
 
         self.global_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         nn.init.normal_(self.global_token, std=0.02)
@@ -302,16 +302,8 @@ class TokenMixerLargeCTR(nn.Module):
         )
 
     def forward(self, user_ids, item_ids, user_vis, item_vis):
-        u_emb = self.user_emb(user_ids)
-        i_emb = self.item_emb(item_ids)
-        e_input = torch.cat([u_emb, i_emb, user_vis, item_vis], dim=-1)
-
-        B = e_input.size(0)
-        if e_input.size(-1) < self.padded_dim:
-            e_input = F.pad(e_input, (0, self.padded_dim - e_input.size(-1)))
-
-        tokens = e_input.view(B, self.num_tokens, self.chunk_size)
-        tokens = self.proj(tokens)
+        tokens = self._tokenize(user_ids, item_ids, user_vis, item_vis)
+        B = tokens.size(0)
 
         global_t = self.global_token.expand(B, -1, -1)
         x = torch.cat([global_t, tokens], dim=1)
@@ -341,6 +333,57 @@ class TokenMixerLargeCTR(nn.Module):
 
 
 # ============================================================
+# HSTU CTR 模型 (arXiv:2402.17152)
+# ============================================================
+
+class HSTUCTR(BaseCTR):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        from hstu import HSTULayer, RMSNorm as HSTURMSNorm
+
+        model_cfg = cfg["model"]
+        T = self.num_tokens
+        hidden_dim = self.hidden_dim
+
+        num_layers = model_cfg["num_layers"]
+        num_heads = model_cfg["num_heads"]
+        ffn_expansion = model_cfg.get("ffn_expansion", 4)
+        dropout = model_cfg.get("dropout", 0.0)
+
+        print(f"  [HSTU] Feature dim: {self.total_dim}, Tokens (T): {T}, "
+              f"Hidden (D): {hidden_dim}, Heads: {num_heads}, Head dim: {hidden_dim // num_heads}")
+        print(f"  Layers: {num_layers}, FFN expansion: {ffn_expansion}, "
+              f"Dropout: {dropout}")
+
+        max_tokens = T + 16
+        self.layers = nn.ModuleList([
+            HSTULayer(
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                max_tokens=max_tokens,
+                ffn_expansion=ffn_expansion,
+                dropout=dropout,
+            )
+            for _ in range(num_layers)
+        ])
+
+        self.output_head = nn.Sequential(
+            HSTURMSNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, user_ids, item_ids, user_vis, item_vis):
+        x = self._tokenize(user_ids, item_ids, user_vis, item_vis)
+
+        for layer in self.layers:
+            x = layer(x)
+
+        x = x.mean(dim=1)
+        logits = self.output_head(x).squeeze(-1)
+        return logits, torch.tensor(0.0, device=logits.device)
+
+
+# ============================================================
 # 构建模型 (统一入口)
 # ============================================================
 
@@ -348,6 +391,8 @@ def build_model(cfg) -> nn.Module:
     arch = cfg["model"].get("arch", "rankmixer")
     if arch == "tokenmixer_large":
         return TokenMixerLargeCTR(cfg)
+    elif arch == "hstu":
+        return HSTUCTR(cfg)
     else:
         return RankMixerCTR(cfg)
 
@@ -398,7 +443,8 @@ def main():
     arch = model_cfg.get("arch", "rankmixer")
 
     print("=" * 60)
-    print(f"{'TokenMixer-Large' if arch == 'tokenmixer_large' else 'RankMixer'} on KuaiVideo_x1")
+    arch_names = {"rankmixer": "RankMixer", "tokenmixer_large": "TokenMixer-Large", "hstu": "HSTU"}
+    print(f"{arch_names.get(arch, arch)} on KuaiVideo_x1")
     print(f"Config: {args.config}")
     print(f"Device: {device}")
     print("=" * 60)
@@ -499,10 +545,14 @@ def main():
                 else:
                     loss = main_loss
                     aux_loss = torch.tensor(0.0)
-            else:
+            elif arch == "rankmixer":
                 # aux_output 是 MoE L1 正则损失
                 loss = main_loss + aux_output
                 aux_loss = aux_output
+            else:
+                # HSTU: 无辅助损失
+                loss = main_loss
+                aux_loss = torch.tensor(0.0)
 
             loss.backward()
 
@@ -520,7 +570,7 @@ def main():
                 avg = epoch_loss / epoch_samples
                 elapsed = time.time() - t0
                 speed = epoch_samples / elapsed
-                aux_name = "Aux" if arch == "tokenmixer_large" else "Reg"
+                aux_name = {"tokenmixer_large": "Aux", "rankmixer": "Reg"}.get(arch, "Aux")
                 aux_val = aux_loss.item() if torch.is_tensor(aux_loss) else aux_loss
                 print(
                     f"  Step {step:5d} | "

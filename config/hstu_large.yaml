@@ -1,0 +1,61 @@
+# ============================================================
+# HSTU-Large on KuaiVideo_x1
+# 论文: "Actions Speak Louder than Words" (Meta, ICML 2024)
+# arXiv:2402.17152
+#
+# HSTU 核心: 无 Softmax 注意力 + U 门控 + 相对位置偏置
+# chunk_size=8 → T=32, D=1024, num_heads=32, head_dim=32
+# 深层 L=12, 大幅扩展容量
+#
+# 注意: 此配置参数量较大, 建议 ≥16GB 显存
+# ============================================================
+
+# --- 数据配置 ---
+data:
+  data_dir: "KuaiVideo_x1 2"
+  train_file: "train.csv"
+  test_file: "test.csv"
+  user_emb_file: "user_visual_emb_dim64.h5"
+  item_emb_file: "item_visual_emb_dim64.h5"
+  num_users: 10000
+  num_items: 3242316
+  item_hash_size: 500000
+  user_vis_dim: 64
+  item_vis_dim: 64
+
+# --- 特征 Embedding 配置 ---
+embedding:
+  user_emb_dim: 64
+  item_emb_dim: 64
+
+# --- HSTU 模型配置 ---
+model:
+  arch: "hstu"
+  chunk_size: 8                          # d → T=32
+  hidden_dim: 1024                       # D
+  num_layers: 12                         # L
+  num_heads: 32                          # H (head_dim = D/H = 32)
+  ffn_expansion: 4                       # FFN 扩展倍率
+  dropout: 0.0
+
+# --- 训练配置 ---
+training:
+  batch_size: 1024
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-5
+  num_epochs: 5
+  grad_clip_norm: 1.0
+  optimizer: "adamw"
+  scheduler: "cosine"
+  scheduler_eta_min: 1.0e-6
+  warmup_steps: 1000
+
+# --- 日志与评估配置 ---
+logging:
+  log_interval: 100
+  eval_samples: 500000
+  save_path: "hstu_large_kuaivideo.pt"
+  save_best: true
+
+# --- 设备配置 ---
+device: "auto"
