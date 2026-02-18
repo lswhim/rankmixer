@@ -1,11 +1,11 @@
 # ============================================================
-# RankMixer-Small on KuaiVideo_x1
-# 对应论文 arXiv:2507.15551 RankMixer-100M 配置
+# RankMixer-Middle on KuaiVideo_x1
+# 介于论文 RankMixer-100M 与 RankMixer-1B 之间
 #
-# 论文配置: T=16, D=768, L=2, k=4, 全 Dense (无 MoE)
-# chunk_size=20 → T = 320/20 = 16, D=768, D/T=48
-# (total_dim = 64+64+64+64+64(DIN seq) = 320)
-# 理论参数量: 2*k*L*T*D² = 2*4*2*16*768² ≈ 150M
+# 配置: T=16, D=1024, L=2, k=4, 全 MoE (Sparse-MoE 扩展)
+# chunk_size=20 → T = 320/20 = 16, D=1024, D/T=64
+# (total_dim = 64*4 + 64(DIN seq) = 320)
+# MoE 替换 Dense FFN, E=8 experts
 # ============================================================
 
 # --- 数据配置 ---
@@ -28,34 +28,35 @@ embedding:
   item_emb_dim: 64
 
 # --- RankMixer 模型配置 ---
-# 论文 RankMixer-100M: 全 Dense 架构, L=2
+# 全 MoE 架构: Per-token FFN 替换为 Sparse-MoE
 model:
   arch: "rankmixer"
   chunk_size: 20                         # d → T=16
-  hidden_dim: 768                        # D
-  num_dense_layers: 2                    # L=2 (全 Dense)
-  num_moe_layers: 0                      # 无 MoE
+  hidden_dim: 1024                       # D
+  num_dense_layers: 0                    # 无 Dense (全部用 MoE 替换)
+  num_moe_layers: 2                      # L=2 (全 MoE)
   ffn_expansion: 4                       # k
-  num_experts: 8                         # (不生效)
-  l1_lambda: 0.01                        # (不生效)
+  num_experts: 8                         # E=8
+  l1_lambda: 0.01                        # MoE L1 稀疏正则系数
 
 # --- 训练配置 ---
 training:
   batch_size: 2048
-  learning_rate: 5.0e-4
+  learning_rate: 3.0e-4
   weight_decay: 1.0e-5
-  num_epochs: 5
+  num_epochs: 100
   grad_clip_norm: 1.0
-  optimizer: "adam"
+  optimizer: "adamw"
   scheduler: "cosine"
   scheduler_eta_min: 1.0e-6
   warmup_steps: 500
+  early_stop_patience: 5
 
 # --- 日志与评估配置 ---
 logging:
   log_interval: 200
   eval_samples: 500000
-  save_path: "rankmixer_small_kuaivideo.pt"
+  save_path: "rankmixer_middle_kuaivideo.pt"
   save_best: true
 
 # --- 设备配置 ---
@@ -64,4 +65,4 @@ device: "auto"
 # --- wandb 配置 ---
 wandb:
   project: "rankmixer"
-  tags: ["rankmixer", "small", "dense"]
+  tags: ["rankmixer", "middle", "moe"]

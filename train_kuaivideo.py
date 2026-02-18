@@ -6,6 +6,11 @@
   - HSTU (arXiv:2402.17152)
   - Vanilla Transformer (Baseline)
 通过 config YAML 中的 model.arch 字段选择
+
+多卡训练:
+  torchrun --nproc_per_node=N train_kuaivideo.py --config config/xxx.yaml
+单卡训练:
+  python train_kuaivideo.py --config config/xxx.yaml
 """
 
 import os
@@ -20,10 +25,47 @@ import yaml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, IterableDataset
 from typing import Tuple
 from sklearn.metrics import roc_auc_score, log_loss
 import wandb
+
+
+# ============================================================
+# 分布式工具
+# ============================================================
+
+def is_dist():
+    """是否处于分布式环境"""
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank():
+    return dist.get_rank() if is_dist() else 0
+
+
+def get_world_size():
+    return dist.get_world_size() if is_dist() else 1
+
+
+def is_main_process():
+    return get_rank() == 0
+
+
+def setup_distributed():
+    """初始化分布式环境 (由 torchrun 设置环境变量)"""
+    if "RANK" not in os.environ:
+        return  # 单卡模式, 不初始化
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+
+
+def cleanup_distributed():
+    if is_dist():
+        dist.destroy_process_group()
 
 
 # ============================================================
@@ -37,6 +79,9 @@ def load_config(config_path: str) -> dict:
 
 
 def get_device(cfg_device: str) -> str:
+    if is_dist():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        return f"cuda:{local_rank}"
     if cfg_device == "auto":
         if torch.backends.mps.is_available():
             return "mps"
@@ -56,7 +101,8 @@ def load_pretrained_embeddings(cfg):
     project_root = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(project_root, data_cfg["data_dir"])
 
-    print("加载预训练 embedding ...")
+    if is_main_process():
+        print("加载预训练 embedding ...")
 
     with h5py.File(os.path.join(data_dir, data_cfg["user_emb_file"]), "r") as f:
         user_keys = f["key"][:]
@@ -80,8 +126,9 @@ def load_pretrained_embeddings(cfg):
         hk = int(k) % item_hash_size
         item_emb_table[hk] = v
 
-    print(f"  User visual emb: {user_emb_table.shape}")
-    print(f"  Item visual emb: {item_emb_table.shape}")
+    if is_main_process():
+        print(f"  User visual emb: {user_emb_table.shape}")
+        print(f"  Item visual emb: {item_emb_table.shape}")
     return user_emb_table, item_emb_table
 
 
@@ -100,14 +147,19 @@ class KuaiVideoIterDataset(IterableDataset):
         self.max_seq_len = cfg["data"].get("max_seq_len", 20)
 
     def __iter__(self):
+        rank = get_rank()
+        world_size = get_world_size()
         count = 0
         max_seq = self.max_seq_len
         with open(self.csv_path, "r") as f:
             reader = csv.reader(f)
             next(reader)
-            for row in reader:
+            for row_idx, row in enumerate(reader):
                 if self.max_samples and count >= self.max_samples:
                     return
+                # DDP 分片: 每个 rank 只处理 row_idx % world_size == rank 的行
+                if row_idx % world_size != rank:
+                    continue
                 user_id = int(row[1])
                 item_id = int(row[2])
                 label = float(row[3])
@@ -652,24 +704,111 @@ def build_model(cfg) -> nn.Module:
 # 评估
 # ============================================================
 
+def compute_gauc(user_ids, labels, preds):
+    """
+    计算 Group AUC (GAUC): 按 user_id 分组计算 AUC, 再按样本数加权平均。
+    只对同时包含正负样本的用户分组计算。
+    """
+    from collections import defaultdict
+    user_data = defaultdict(lambda: ([], []))
+    for uid, label, pred in zip(user_ids, labels, preds):
+        user_data[uid][0].append(label)
+        user_data[uid][1].append(pred)
+
+    total_auc = 0.0
+    total_count = 0
+    for uid, (u_labels, u_preds) in user_data.items():
+        u_labels = np.array(u_labels)
+        u_preds = np.array(u_preds)
+        # 只有同时包含正负样本才能计算 AUC
+        if len(set(u_labels)) < 2:
+            continue
+        try:
+            auc = roc_auc_score(u_labels, u_preds)
+            n = len(u_labels)
+            total_auc += auc * n
+            total_count += n
+        except ValueError:
+            continue
+
+    if total_count == 0:
+        return 0.0
+    return total_auc / total_count
+
+
 def evaluate(model, dataloader, device):
-    model.eval()
-    all_labels, all_preds = [], []
+    """
+    评估模型。DDP 模式下每个 rank 各自跑一部分数据，
+    通过 all_gather 汇总到 rank 0 计算全局指标。
+    返回 (auc, gauc, logloss)。
+    """
+    raw_model = model.module if hasattr(model, "module") else model
+    raw_model.eval()
+    all_labels, all_preds, all_uids = [], [], []
     with torch.no_grad():
         for batch in dataloader:
             uids, iids, u_vis, i_vis, seq_items, seq_lens, labels = batch
-            logits, _ = model(
+            logits, _ = raw_model(
                 uids.to(device), iids.to(device),
                 u_vis.to(device), i_vis.to(device),
                 seq_items.to(device), seq_lens.to(device),
             )
-            probs = torch.sigmoid(logits).cpu().numpy()
-            all_labels.extend(labels.numpy().tolist())
-            all_preds.extend(probs.tolist())
+            probs = torch.sigmoid(logits).cpu()
+            all_labels.append(labels)
+            all_preds.append(probs)
+            all_uids.append(uids)
 
-    all_labels = np.array(all_labels)
-    all_preds = np.clip(np.array(all_preds), 1e-7, 1 - 1e-7)
-    return roc_auc_score(all_labels, all_preds), log_loss(all_labels, all_preds)
+    all_labels = torch.cat(all_labels)
+    all_preds = torch.cat(all_preds)
+    all_uids = torch.cat(all_uids)
+
+    if is_dist():
+        # all-gather across ranks
+        world_size = get_world_size()
+        local_size = torch.tensor([all_labels.size(0)], dtype=torch.long, device=device)
+        sizes_list = [torch.zeros_like(local_size) for _ in range(world_size)]
+        dist.all_gather(sizes_list, local_size)
+        max_size = max(s.item() for s in sizes_list)
+
+        # pad to max_size for uniform gather
+        def pad_to(t, n):
+            if t.size(0) < n:
+                return torch.cat([t, torch.zeros(n - t.size(0), dtype=t.dtype)])
+            return t[:n]
+
+        padded_labels = pad_to(all_labels, max_size).to(device)
+        padded_preds = pad_to(all_preds, max_size).to(device)
+        padded_uids = pad_to(all_uids.float(), max_size).to(device)
+
+        gathered_labels = [torch.zeros_like(padded_labels) for _ in range(world_size)]
+        gathered_preds = [torch.zeros_like(padded_preds) for _ in range(world_size)]
+        gathered_uids = [torch.zeros_like(padded_uids) for _ in range(world_size)]
+        dist.all_gather(gathered_labels, padded_labels)
+        dist.all_gather(gathered_preds, padded_preds)
+        dist.all_gather(gathered_uids, padded_uids)
+
+        if is_main_process():
+            final_labels, final_preds, final_uids = [], [], []
+            for i in range(world_size):
+                n = sizes_list[i].item()
+                final_labels.append(gathered_labels[i][:n].cpu())
+                final_preds.append(gathered_preds[i][:n].cpu())
+                final_uids.append(gathered_uids[i][:n].cpu())
+            all_labels = torch.cat(final_labels).numpy()
+            all_preds = torch.cat(final_preds).numpy()
+            all_uids = torch.cat(final_uids).numpy().astype(int)
+        else:
+            return 0.0, 0.0, 0.0  # 非 rank 0 不需要结果
+    else:
+        all_labels = all_labels.numpy()
+        all_preds = all_preds.numpy()
+        all_uids = all_uids.numpy().astype(int)
+
+    all_preds = np.clip(all_preds, 1e-7, 1 - 1e-7)
+    auc = roc_auc_score(all_labels, all_preds)
+    gauc = compute_gauc(all_uids, all_labels, all_preds)
+    logloss = log_loss(all_labels, all_preds)
+    return auc, gauc, logloss
 
 
 # ============================================================
@@ -680,10 +819,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config", type=str,
-        default=os.path.join(os.path.dirname(__file__), "config", "kuaivideo_small.yaml"),
+        default=os.path.join(os.path.dirname(__file__), "config", "rankmixer_small.yaml"),
         help="配置文件路径"
     )
     args = parser.parse_args()
+
+    # --- 分布式初始化 ---
+    setup_distributed()
+    rank = get_rank()
+    world_size = get_world_size()
 
     cfg = load_config(args.config)
     device = get_device(cfg.get("device", "auto"))
@@ -694,55 +838,59 @@ def main():
     model_cfg = cfg["model"]
     arch = model_cfg.get("arch", "rankmixer")
 
-    # --- wandb 初始化 ---
-    wandb_cfg = cfg.get("wandb", {})
-    wandb_project = wandb_cfg.get("project", "rankmixer")
-    wandb_name = wandb_cfg.get("name", None)
-    # 自动生成 run name: arch + config 文件名 (去掉路径和扩展名)
-    if wandb_name is None:
-        config_basename = os.path.splitext(os.path.basename(args.config))[0]
-        wandb_name = config_basename
-    wandb_tags = wandb_cfg.get("tags", [arch])
+    # --- wandb 初始化 (仅 rank 0) ---
+    if is_main_process():
+        wandb_cfg = cfg.get("wandb", {})
+        wandb_project = wandb_cfg.get("project", "rankmixer")
+        wandb_name = wandb_cfg.get("name", None)
+        if wandb_name is None:
+            config_basename = os.path.splitext(os.path.basename(args.config))[0]
+            wandb_name = config_basename
+        wandb_tags = wandb_cfg.get("tags", [arch])
 
-    wandb.init(
-        project=wandb_project,
-        name=wandb_name,
-        tags=wandb_tags,
-        config={
-            "arch": arch,
-            "model": model_cfg,
-            "training": train_cfg,
-            "data": {k: v for k, v in cfg["data"].items()
-                     if k not in ("data_dir", "train_file", "test_file",
-                                  "user_emb_file", "item_emb_file")},
-            "embedding": cfg["embedding"],
-        },
-    )
+        wandb.init(
+            project=wandb_project,
+            name=wandb_name,
+            tags=wandb_tags,
+            config={
+                "arch": arch,
+                "model": model_cfg,
+                "training": train_cfg,
+                "data": {k: v for k, v in cfg["data"].items()
+                         if k not in ("data_dir", "train_file", "test_file",
+                                      "user_emb_file", "item_emb_file")},
+                "embedding": cfg["embedding"],
+                "world_size": world_size,
+            },
+        )
 
-    print("=" * 60)
-    arch_names = {"rankmixer": "RankMixer", "tokenmixer_large": "TokenMixer-Large", "hstu": "HSTU", "transformer": "Transformer"}
-    print(f"{arch_names.get(arch, arch)} on KuaiVideo_x1")
-    print(f"Config: {args.config}")
-    print(f"Device: {device}")
-    print("=" * 60)
+    if is_main_process():
+        print("=" * 60)
+        arch_names = {"rankmixer": "RankMixer", "tokenmixer_large": "TokenMixer-Large", "hstu": "HSTU", "transformer": "Transformer"}
+        print(f"{arch_names.get(arch, arch)} on KuaiVideo_x1")
+        print(f"Config: {args.config}")
+        print(f"Device: {device} | World size: {world_size}")
+        print("=" * 60)
 
-    print("\n--- Model Config ---")
-    for k, v in model_cfg.items():
-        print(f"  {k}: {v}")
-    print("\n--- Training Config ---")
-    for k, v in train_cfg.items():
-        print(f"  {k}: {v}")
+        print("\n--- Model Config ---")
+        for k, v in model_cfg.items():
+            print(f"  {k}: {v}")
+        print("\n--- Training Config ---")
+        for k, v in train_cfg.items():
+            print(f"  {k}: {v}")
 
     user_vis_emb, item_vis_emb = load_pretrained_embeddings(cfg)
 
-    print("\n构建模型 ...")
+    if is_main_process():
+        print("\n构建模型 ...")
     model = build_model(cfg).to(device)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"  总参数量: {total_params / 1e6:.2f}M")
-    wandb.log({"model/total_params_M": total_params / 1e6}, step=0)
+    if is_main_process():
+        print(f"  总参数量: {total_params / 1e6:.2f}M")
+        wandb.log({"model/total_params_M": total_params / 1e6}, step=0)
 
     # RankMixer 理论参数量
-    if arch == "rankmixer":
+    if arch == "rankmixer" and is_main_process():
         T = model.num_tokens
         D = model_cfg["hidden_dim"]
         k = model_cfg["ffn_expansion"]
@@ -753,6 +901,10 @@ def main():
         moe_theory = 2 * k * L_moe * T * D * D * E
         print(f"  论文理论 Dense 参数量 (2kL_dTD²): {dense_theory / 1e6:.2f}M")
         print(f"  论文理论 MoE 参数量 (2kL_mTD²E): {moe_theory / 1e6:.2f}M")
+
+    # --- DDP 包装 ---
+    if is_dist():
+        model = DDP(model, device_ids=[int(os.environ.get("LOCAL_RANK", 0))])
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=train_cfg["learning_rate"],
@@ -769,6 +921,8 @@ def main():
     test_csv = os.path.join(data_dir, cfg["data"]["test_file"])
 
     best_auc = 0.0
+    no_improve_count = 0
+    early_stop_patience = train_cfg.get("early_stop_patience", 5)
     save_path = os.path.join(project_root, log_cfg["save_path"])
     warmup_steps = train_cfg.get("warmup_steps", 0)
 
@@ -778,10 +932,11 @@ def main():
     global_step = 0
 
     for epoch in range(train_cfg["num_epochs"]):
-        print(f"\n{'='*60}")
-        print(f"Epoch {epoch + 1}/{train_cfg['num_epochs']}  "
-              f"(lr={optimizer.param_groups[0]['lr']:.2e})")
-        print(f"{'='*60}")
+        if is_main_process():
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch + 1}/{train_cfg['num_epochs']}  "
+                  f"(lr={optimizer.param_groups[0]['lr']:.2e})")
+            print(f"{'='*60}")
 
         train_dataset = KuaiVideoIterDataset(
             train_csv, user_vis_emb, item_vis_emb, cfg
@@ -818,7 +973,6 @@ def main():
             main_loss = criterion(main_logits, labels)
 
             if arch == "tokenmixer_large":
-                # aux_output 是辅助 logits
                 if aux_output.abs().sum() > 0:
                     aux_loss = criterion(aux_output, labels)
                     loss = main_loss + aux_loss_weight * aux_loss
@@ -826,11 +980,9 @@ def main():
                     loss = main_loss
                     aux_loss = torch.tensor(0.0)
             elif arch == "rankmixer":
-                # aux_output 是 MoE L1 正则损失
                 loss = main_loss + aux_output
                 aux_loss = aux_output
             else:
-                # HSTU / Transformer: 无辅助损失
                 loss = main_loss
                 aux_loss = torch.tensor(0.0)
 
@@ -847,17 +999,18 @@ def main():
             step += 1
             global_step += 1
 
-            # wandb step-level logging
+            # wandb step-level logging (rank 0 only)
             aux_val = aux_loss.item() if torch.is_tensor(aux_loss) else aux_loss
-            wandb.log({
-                "train/loss": loss.item(),
-                "train/main_loss": main_loss.item(),
-                "train/aux_loss": aux_val,
-                "train/lr": optimizer.param_groups[0]["lr"],
-                "train/epoch": epoch + 1,
-            }, step=global_step)
+            if is_main_process():
+                wandb.log({
+                    "train/loss": loss.item(),
+                    "train/main_loss": main_loss.item(),
+                    "train/aux_loss": aux_val,
+                    "train/lr": optimizer.param_groups[0]["lr"],
+                    "train/epoch": epoch + 1,
+                }, step=global_step)
 
-            if step % log_cfg["log_interval"] == 0:
+            if step % log_cfg["log_interval"] == 0 and is_main_process():
                 avg = epoch_loss / epoch_samples
                 elapsed = time.time() - t0
                 speed = epoch_samples / elapsed
@@ -876,21 +1029,31 @@ def main():
                     "train/speed_samples_per_sec": speed,
                 }, step=global_step)
 
+        # 同步 epoch_loss 和 epoch_samples (可选, 让 rank 0 拿到全局统计)
+        if is_dist():
+            stats = torch.tensor([epoch_loss, float(epoch_samples)], device=device)
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+            epoch_loss = stats[0].item()
+            epoch_samples = int(stats[1].item())
+
         avg_loss = epoch_loss / max(epoch_samples, 1)
         elapsed = time.time() - t0
-        print(f"\n  Epoch {epoch+1} 训练完成: Loss={avg_loss:.4f}, "
-              f"Samples={epoch_samples}, Time={elapsed:.1f}s")
+        if is_main_process():
+            print(f"\n  Epoch {epoch+1} 训练完成: Loss={avg_loss:.4f}, "
+                  f"Samples={epoch_samples}, Time={elapsed:.1f}s")
 
-        wandb.log({
-            "epoch/train_loss": avg_loss,
-            "epoch/train_samples": epoch_samples,
-            "epoch/train_time_s": elapsed,
-            "epoch/epoch": epoch + 1,
-        }, step=global_step)
+            wandb.log({
+                "epoch/train_loss": avg_loss,
+                "epoch/train_samples": epoch_samples,
+                "epoch/train_time_s": elapsed,
+                "epoch/epoch": epoch + 1,
+            }, step=global_step)
 
         scheduler.step()
 
-        print("\n  评估中 ...")
+        # --- 评估 ---
+        if is_main_process():
+            print("\n  评估中 ...")
         eval_samples = log_cfg["eval_samples"] if log_cfg["eval_samples"] > 0 else None
         test_dataset = KuaiVideoIterDataset(
             test_csv, user_vis_emb, item_vis_emb, cfg, max_samples=eval_samples
@@ -899,32 +1062,60 @@ def main():
             test_dataset, batch_size=train_cfg["batch_size"] * 2,
             collate_fn=collate_fn, num_workers=0,
         )
-        auc, logloss = evaluate(model, test_loader, device)
-        print(f"  Test AUC: {auc:.4f} | Test LogLoss: {logloss:.4f}")
+        auc, gauc, logloss = evaluate(model, test_loader, device)
 
-        wandb.log({
-            "eval/auc": auc,
-            "eval/logloss": logloss,
-            "eval/epoch": epoch + 1,
-        }, step=global_step)
+        # Early stopping: rank 0 判断是否提升，广播给所有 rank
+        should_stop = False
+        if is_main_process():
+            print(f"  Test AUC: {auc:.4f} | Test GAUC: {gauc:.4f} | Test LogLoss: {logloss:.4f}")
 
-        if log_cfg.get("save_best", True):
-            if auc > best_auc:
-                best_auc = auc
-                torch.save(model.state_dict(), save_path)
-                print(f"  ** 新最佳模型已保存 (AUC={auc:.4f}) → {save_path}")
-                wandb.run.summary["best_auc"] = best_auc
-                wandb.run.summary["best_epoch"] = epoch + 1
-        else:
-            torch.save(model.state_dict(), save_path)
-            print(f"  模型已保存 → {save_path}")
+            wandb.log({
+                "eval/auc": auc,
+                "eval/gauc": gauc,
+                "eval/logloss": logloss,
+                "eval/epoch": epoch + 1,
+            }, step=global_step)
 
-    print(f"\n{'='*60}")
-    print(f"训练完成! Best Test AUC: {best_auc:.4f}")
-    print(f"{'='*60}")
+            if log_cfg.get("save_best", True):
+                if auc > best_auc:
+                    best_auc = auc
+                    no_improve_count = 0
+                    raw_model = model.module if hasattr(model, "module") else model
+                    torch.save(raw_model.state_dict(), save_path)
+                    print(f"  ** 新最佳模型已保存 (AUC={auc:.4f}) → {save_path}")
+                    wandb.run.summary["best_auc"] = best_auc
+                    wandb.run.summary["best_gauc"] = gauc
+                    wandb.run.summary["best_epoch"] = epoch + 1
+                else:
+                    no_improve_count += 1
+                    print(f"  AUC 未提升 ({no_improve_count}/{early_stop_patience})")
+                    if no_improve_count >= early_stop_patience:
+                        print(f"  ** Early stopping: 连续 {early_stop_patience} 个 epoch 无提升")
+                        should_stop = True
+            else:
+                raw_model = model.module if hasattr(model, "module") else model
+                torch.save(raw_model.state_dict(), save_path)
+                print(f"  模型已保存 → {save_path}")
 
-    wandb.run.summary["final_best_auc"] = best_auc
-    wandb.finish()
+        # DDP: 广播 early stop 信号
+        if is_dist():
+            stop_tensor = torch.tensor([1 if should_stop else 0], dtype=torch.long, device=device)
+            dist.broadcast(stop_tensor, src=0)
+            should_stop = stop_tensor.item() == 1
+            dist.barrier()
+        
+        if should_stop:
+            break
+
+    if is_main_process():
+        print(f"\n{'='*60}")
+        print(f"训练完成! Best Test AUC: {best_auc:.4f}")
+        print(f"{'='*60}")
+
+        wandb.run.summary["final_best_auc"] = best_auc
+        wandb.finish()
+
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

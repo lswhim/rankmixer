@@ -46,7 +46,15 @@ def extract():
 
     print(f"[extract] 正在解压 {ZIP_FILE} ...")
     with zipfile.ZipFile(ZIP_FILE, "r") as zf:
-        zf.extractall(SAVE_DIR)
+        # 检查 zip 内部是否自带 KuaiVideo_x1/ 顶层目录
+        top_dirs = {name.split("/")[0] for name in zf.namelist() if "/" in name}
+        if "KuaiVideo_x1" in top_dirs and len(top_dirs) == 1:
+            # zip 内部已有 KuaiVideo_x1/ 目录，直接解压到项目根目录
+            zf.extractall(SAVE_DIR)
+        else:
+            # zip 内部没有顶层目录，解压到 KuaiVideo_x1/ 里
+            os.makedirs(EXTRACT_DIR, exist_ok=True)
+            zf.extractall(EXTRACT_DIR)
     print(f"[extract] 解压完成 → {EXTRACT_DIR}")
 
 
@@ -72,7 +80,7 @@ def verify():
 
     if all_ok:
         print("\n[done] 数据准备完成，可以开始训练:")
-        print(f"  python train_kuaivideo.py --config config/kuaivideo_small.yaml")
+        print(f"  python train_kuaivideo.py --config config/rankmixer_small.yaml")
 
 
 if __name__ == "__main__":

@@ -109,13 +109,13 @@ python prepare_data.py
 
 ```bash
 # Small (Dense, ~150M) — 论文 RankMixer-100M
-python train_kuaivideo.py --config config/kuaivideo_small.yaml
+python train_kuaivideo.py --config config/rankmixer_small.yaml
 
 # Middle (MoE, E=8) — Sparse-MoE 扩展实验
-python train_kuaivideo.py --config config/kuaivideo_middle.yaml
+python train_kuaivideo.py --config config/rankmixer_middle.yaml
 
 # Large (Dense, ~1.2B) — 论文 RankMixer-1B
-python train_kuaivideo.py --config config/kuaivideo_large.yaml
+python train_kuaivideo.py --config config/rankmixer_large.yaml
 ```
 
 ### 3. Train TokenMixer-Large
@@ -160,9 +160,9 @@ python train_kuaivideo.py --config config/transformer_large.yaml
 
 | Config | T | D | L | FFN Type | E | Paper Reference |
 |--------|---|---|---|----------|---|-----------------|
-| `kuaivideo_small.yaml` | 16 | 768 | 2 | Dense | — | RankMixer-100M |
-| `kuaivideo_middle.yaml` | 16 | 1024 | 2 | Sparse-MoE | 8 | MoE extension |
-| `kuaivideo_large.yaml` | 32 | 1536 | 2 | Dense | — | RankMixer-1B |
+| `rankmixer_small.yaml` | 16 | 768 | 2 | Dense | — | RankMixer-100M |
+| `rankmixer_middle.yaml` | 16 | 1024 | 2 | Sparse-MoE | 8 | MoE extension |
+| `rankmixer_large.yaml` | 32 | 1536 | 2 | Dense | — | RankMixer-1B |
 
 ### TokenMixer-Large
 
@@ -197,9 +197,9 @@ rankmixer/
 ├── train_kuaivideo.py        # Unified training script (auto-selects model by config)
 ├── prepare_data.py           # Download & extract dataset
 ├── config/
-│   ├── kuaivideo_small.yaml  # RankMixer configs
-│   ├── kuaivideo_middle.yaml
-│   ├── kuaivideo_large.yaml
+│   ├── rankmixer_small.yaml  # RankMixer configs
+│   ├── rankmixer_middle.yaml
+│   ├── rankmixer_large.yaml
 │   ├── tokenmixer_small.yaml # TokenMixer-Large configs
 │   ├── tokenmixer_middle.yaml
 │   ├── hstu_small.yaml       # HSTU configs
