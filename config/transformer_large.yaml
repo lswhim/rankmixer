@@ -1,0 +1,61 @@
+# ============================================================
+# Vanilla Transformer-Large on KuaiVideo_x1
+#
+# 标准 Transformer 对照组 (大规模):
+# Pre-LN, Multi-Head Self-Attention + FFN (GELU), Mean Pooling
+# chunk_size=10 → T=32, D=1536, L=8, H=24, head_dim=64
+# (total_dim = 64*4 + 64(DIN seq) = 320)
+#
+# 注意: 此配置参数量较大, 建议 ≥24GB 显存
+# ============================================================
+
+# --- 数据配置 ---
+data:
+  data_dir: "KuaiVideo_x1 2"
+  train_file: "train.csv"
+  test_file: "test.csv"
+  user_emb_file: "user_visual_emb_dim64.h5"
+  item_emb_file: "item_visual_emb_dim64.h5"
+  num_users: 10000
+  num_items: 3242316
+  item_hash_size: 500000
+  user_vis_dim: 64
+  item_vis_dim: 64
+  max_seq_len: 20
+
+# --- 特征 Embedding 配置 ---
+embedding:
+  user_emb_dim: 64
+  item_emb_dim: 64
+
+# --- Transformer 模型配置 ---
+model:
+  arch: "transformer"
+  chunk_size: 10                         # d → T=32
+  hidden_dim: 1536                       # D
+  num_layers: 8                          # L
+  num_heads: 24                          # H (head_dim = 64)
+  ffn_expansion: 4                       # FFN 扩展倍率
+  dropout: 0.0
+
+# --- 训练配置 ---
+training:
+  batch_size: 1024
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-5
+  num_epochs: 5
+  grad_clip_norm: 1.0
+  optimizer: "adamw"
+  scheduler: "cosine"
+  scheduler_eta_min: 1.0e-6
+  warmup_steps: 1000
+
+# --- 日志与评估配置 ---
+logging:
+  log_interval: 100
+  eval_samples: 500000
+  save_path: "transformer_large_kuaivideo.pt"
+  save_best: true
+
+# --- 设备配置 ---
+device: "auto"

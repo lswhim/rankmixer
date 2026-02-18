@@ -1,0 +1,59 @@
+# ============================================================
+# Vanilla Transformer (Baseline) on KuaiVideo_x1
+#
+# 最简单的标准 Transformer 作为对照组:
+# Pre-LN, Multi-Head Self-Attention + FFN (GELU), Mean Pooling
+# chunk_size=20 → T=16, D=768, L=4, H=16, head_dim=48
+# (total_dim = 64*4 + 64(DIN seq) = 320)
+# ============================================================
+
+# --- 数据配置 ---
+data:
+  data_dir: "KuaiVideo_x1 2"
+  train_file: "train.csv"
+  test_file: "test.csv"
+  user_emb_file: "user_visual_emb_dim64.h5"
+  item_emb_file: "item_visual_emb_dim64.h5"
+  num_users: 10000
+  num_items: 3242316
+  item_hash_size: 500000
+  user_vis_dim: 64
+  item_vis_dim: 64
+  max_seq_len: 20
+
+# --- 特征 Embedding 配置 ---
+embedding:
+  user_emb_dim: 64
+  item_emb_dim: 64
+
+# --- Transformer 模型配置 ---
+model:
+  arch: "transformer"
+  chunk_size: 20                         # d → T=16
+  hidden_dim: 768                        # D
+  num_layers: 4                          # L
+  num_heads: 16                          # H (head_dim = 48)
+  ffn_expansion: 4                       # FFN 扩展倍率
+  dropout: 0.0
+
+# --- 训练配置 ---
+training:
+  batch_size: 2048
+  learning_rate: 5.0e-4
+  weight_decay: 1.0e-5
+  num_epochs: 5
+  grad_clip_norm: 1.0
+  optimizer: "adamw"
+  scheduler: "cosine"
+  scheduler_eta_min: 1.0e-6
+  warmup_steps: 500
+
+# --- 日志与评估配置 ---
+logging:
+  log_interval: 200
+  eval_samples: 500000
+  save_path: "transformer_small_kuaivideo.pt"
+  save_best: true
+
+# --- 设备配置 ---
+device: "auto"

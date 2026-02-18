@@ -1,9 +1,10 @@
 """
 在 KuaiVideo_x1 数据集上进行 CTR 预测训练
-支持三种模型架构:
+支持四种模型架构:
   - RankMixer (arXiv:2507.15551)
   - TokenMixer-Large (arXiv:2602.06563)
   - HSTU (arXiv:2402.17152)
+  - Vanilla Transformer (Baseline)
 通过 config YAML 中的 model.arch 字段选择
 """
 
@@ -417,6 +418,64 @@ class TokenMixerLargeCTR(BaseCTR):
 
 
 # ============================================================
+# Vanilla Transformer CTR 模型 (Baseline)
+# 标准 Multi-Head Self-Attention + FFN, 作为最简对照组
+# ============================================================
+
+class TransformerCTR(BaseCTR):
+    """
+    最简单的 Transformer baseline:
+    - 继承 BaseCTR 复用 embedding + DIN 序列编码 + chunk tokenization
+    - 标准 Pre-LN Transformer: LayerNorm → MHSA → residual → LayerNorm → FFN → residual
+    - Mean pooling → 预测头
+    - 无 MoE、无 global token、无花哨设计
+    """
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        model_cfg = cfg["model"]
+        T = self.num_tokens
+        hidden_dim = self.hidden_dim
+
+        num_layers = model_cfg["num_layers"]
+        num_heads = model_cfg["num_heads"]
+        ffn_expansion = model_cfg.get("ffn_expansion", 4)
+        dropout = model_cfg.get("dropout", 0.0)
+
+        print(f"  [Transformer] Feature dim: {self.total_dim}, Tokens (T): {T}, "
+              f"Hidden (D): {hidden_dim}, Heads: {num_heads}, "
+              f"Head dim: {hidden_dim // num_heads}")
+        print(f"  Layers: {num_layers}, FFN expansion: {ffn_expansion}, "
+              f"Dropout: {dropout}")
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * ffn_expansion,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,  # Pre-LN
+        )
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers,
+            enable_nested_tensor=False,
+        )
+
+        self.output_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens):
+        x = self._tokenize(user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens)
+        x = self.encoder(x)
+        x = x.mean(dim=1)
+        logits = self.output_head(x).squeeze(-1)
+        return logits, torch.tensor(0.0, device=logits.device)
+
+
+# ============================================================
 # HSTU CTR 模型 (arXiv:2402.17152)
 # 原文做法: Content-Action 交替序列 + Target-Aware Attention
 # 不继承 BaseCTR, 独立实现序列输入
@@ -582,6 +641,8 @@ def build_model(cfg) -> nn.Module:
         return TokenMixerLargeCTR(cfg)
     elif arch == "hstu":
         return HSTUCTR(cfg)
+    elif arch == "transformer":
+        return TransformerCTR(cfg)
     else:
         return RankMixerCTR(cfg)
 
@@ -633,7 +694,7 @@ def main():
     arch = model_cfg.get("arch", "rankmixer")
 
     print("=" * 60)
-    arch_names = {"rankmixer": "RankMixer", "tokenmixer_large": "TokenMixer-Large", "hstu": "HSTU"}
+    arch_names = {"rankmixer": "RankMixer", "tokenmixer_large": "TokenMixer-Large", "hstu": "HSTU", "transformer": "Transformer"}
     print(f"{arch_names.get(arch, arch)} on KuaiVideo_x1")
     print(f"Config: {args.config}")
     print(f"Device: {device}")
