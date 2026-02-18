@@ -1,0 +1,526 @@
+"""
+使用 RankMixer 在 KuaiVideo_x1 数据集上进行 CTR 预测训练
+所有超参数通过 config/kuaivideo.yaml 加载
+"""
+
+import os
+import sys
+import csv
+import time
+import math
+import argparse
+import numpy as np
+import h5py
+import yaml
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, IterableDataset
+from typing import Tuple
+from sklearn.metrics import roc_auc_score, log_loss
+
+
+# ============================================================
+# 配置加载
+# ============================================================
+
+def load_config(config_path: str) -> dict:
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+    return cfg
+
+
+def get_device(cfg_device: str) -> str:
+    if cfg_device == "auto":
+        if torch.backends.mps.is_available():
+            return "mps"
+        elif torch.cuda.is_available():
+            return "cuda"
+        else:
+            return "cpu"
+    return cfg_device
+
+
+# ============================================================
+# 预训练 Embedding 加载
+# ============================================================
+
+def load_pretrained_embeddings(cfg):
+    data_cfg = cfg["data"]
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(project_root, data_cfg["data_dir"])
+
+    print("加载预训练 embedding ...")
+
+    with h5py.File(os.path.join(data_dir, data_cfg["user_emb_file"]), "r") as f:
+        user_keys = f["key"][:]
+        user_vals = f["value"][:].astype(np.float32)
+
+    num_users = data_cfg["num_users"]
+    user_vis_dim = data_cfg["user_vis_dim"]
+    user_emb_table = np.zeros((num_users, user_vis_dim), dtype=np.float32)
+    for k, v in zip(user_keys, user_vals):
+        if k < num_users:
+            user_emb_table[k] = v
+
+    with h5py.File(os.path.join(data_dir, data_cfg["item_emb_file"]), "r") as f:
+        item_keys = f["key"][:]
+        item_vals = f["value"][:].astype(np.float32)
+
+    item_hash_size = data_cfg["item_hash_size"]
+    item_vis_dim = data_cfg["item_vis_dim"]
+    item_emb_table = np.zeros((item_hash_size, item_vis_dim), dtype=np.float32)
+    for k, v in zip(item_keys, item_vals):
+        hk = int(k) % item_hash_size
+        item_emb_table[hk] = v
+
+    print(f"  User visual emb: {user_emb_table.shape}")
+    print(f"  Item visual emb: {item_emb_table.shape}")
+    return user_emb_table, item_emb_table
+
+
+# ============================================================
+# 数据集
+# ============================================================
+
+class KuaiVideoIterDataset(IterableDataset):
+    def __init__(self, csv_path, user_vis_emb, item_vis_emb, cfg, max_samples=None):
+        self.csv_path = csv_path
+        self.user_vis_emb = user_vis_emb
+        self.item_vis_emb = item_vis_emb
+        self.num_users = cfg["data"]["num_users"]
+        self.item_hash_size = cfg["data"]["item_hash_size"]
+        self.max_samples = max_samples
+
+    def __iter__(self):
+        count = 0
+        with open(self.csv_path, "r") as f:
+            reader = csv.reader(f)
+            next(reader)
+            for row in reader:
+                if self.max_samples and count >= self.max_samples:
+                    return
+                user_id = int(row[1])
+                item_id = int(row[2])
+                label = float(row[3])
+                uid = min(user_id, self.num_users - 1)
+                iid_hash = item_id % self.item_hash_size
+                user_vis = self.user_vis_emb[uid]
+                item_vis = self.item_vis_emb[iid_hash]
+                yield (
+                    uid, iid_hash,
+                    torch.tensor(user_vis, dtype=torch.float32),
+                    torch.tensor(item_vis, dtype=torch.float32),
+                    label,
+                )
+                count += 1
+
+
+def collate_fn(batch):
+    user_ids, item_ids, user_vis, item_vis, labels = zip(*batch)
+    return (
+        torch.tensor(user_ids, dtype=torch.long),
+        torch.tensor(item_ids, dtype=torch.long),
+        torch.stack(user_vis),
+        torch.stack(item_vis),
+        torch.tensor(labels, dtype=torch.float32),
+    )
+
+
+# ============================================================
+# 模型组件
+# ============================================================
+
+class MultiHeadTokenMixing(nn.Module):
+    def __init__(self, num_tokens, hidden_dim):
+        super().__init__()
+        self.T = num_tokens
+        self.D = hidden_dim
+        self.head_dim = hidden_dim // num_tokens
+        assert hidden_dim % num_tokens == 0
+
+    def forward(self, x):
+        B = x.size(0)
+        x = x.view(B, self.T, self.T, self.head_dim)
+        x = x.transpose(1, 2).contiguous()
+        x = x.view(B, self.T, self.D)
+        return x
+
+
+class PerTokenFFN(nn.Module):
+    def __init__(self, num_tokens, hidden_dim, expansion=4):
+        super().__init__()
+        kD = hidden_dim * expansion
+        self.W1 = nn.Parameter(torch.empty(num_tokens, hidden_dim, kD))
+        self.b1 = nn.Parameter(torch.zeros(num_tokens, kD))
+        self.W2 = nn.Parameter(torch.empty(num_tokens, kD, hidden_dim))
+        self.b2 = nn.Parameter(torch.zeros(num_tokens, hidden_dim))
+        for i in range(num_tokens):
+            nn.init.kaiming_uniform_(self.W1[i], a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.W2[i], a=math.sqrt(5))
+
+    def forward(self, x):
+        h = torch.einsum('btd,tdh->bth', x, self.W1) + self.b1
+        h = F.gelu(h)
+        return torch.einsum('bth,thd->btd', h, self.W2) + self.b2
+
+
+class ReLURouter(nn.Module):
+    def __init__(self, hidden_dim, num_experts):
+        super().__init__()
+        self.gate = nn.Linear(hidden_dim, num_experts)
+
+    def forward(self, x):
+        return F.relu(self.gate(x))
+
+
+class PerTokenMoEFFN(nn.Module):
+    def __init__(self, num_tokens, hidden_dim, num_experts, ffn_expansion, l1_lambda):
+        super().__init__()
+        self.T = num_tokens
+        self.num_experts = num_experts
+        self.l1_lambda = l1_lambda
+        kD = hidden_dim * ffn_expansion
+
+        self.W1 = nn.Parameter(torch.empty(num_tokens, num_experts, hidden_dim, kD))
+        self.b1 = nn.Parameter(torch.zeros(num_tokens, num_experts, kD))
+        self.W2 = nn.Parameter(torch.empty(num_tokens, num_experts, kD, hidden_dim))
+        self.b2 = nn.Parameter(torch.zeros(num_tokens, num_experts, hidden_dim))
+
+        for t in range(num_tokens):
+            for e in range(num_experts):
+                nn.init.kaiming_uniform_(self.W1[t, e], a=math.sqrt(5))
+                nn.init.kaiming_uniform_(self.W2[t, e], a=math.sqrt(5))
+
+        self.router_train = ReLURouter(hidden_dim, num_experts)
+        self.router_infer = ReLURouter(hidden_dim, num_experts)
+
+    def _expert_forward(self, x, gate):
+        h = torch.einsum('btd,tedk->btek', x, self.W1) + self.b1.unsqueeze(0)
+        h = F.gelu(h)
+        out = torch.einsum('btek,tekd->bted', h, self.W2) + self.b2.unsqueeze(0)
+        return torch.einsum('bte,bted->btd', gate, out)
+
+    def forward(self, x):
+        B, T, D = x.shape
+        if self.training:
+            g_train = self.router_train(x.reshape(-1, D)).view(B, T, self.num_experts)
+            g_infer = self.router_infer(x.reshape(-1, D)).view(B, T, self.num_experts)
+            output = self._expert_forward(x, g_train)
+            reg = self.l1_lambda * g_infer.sum() / (B * T)
+        else:
+            gate = self.router_infer(x.reshape(-1, D)).view(B, T, self.num_experts)
+            output = self._expert_forward(x, gate)
+            reg = torch.tensor(0.0, device=x.device)
+        return output, reg
+
+
+class RankMixerBlock(nn.Module):
+    def __init__(self, num_tokens, hidden_dim, ffn_expansion):
+        super().__init__()
+        self.mixing = MultiHeadTokenMixing(num_tokens, hidden_dim)
+        self.pffn = PerTokenFFN(num_tokens, hidden_dim, ffn_expansion)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x):
+        s = self.norm1(self.mixing(x) + x)
+        return self.norm2(self.pffn(s) + s)
+
+
+class RankMixerMoEBlock(nn.Module):
+    def __init__(self, num_tokens, hidden_dim, num_experts, ffn_expansion, l1_lambda):
+        super().__init__()
+        self.mixing = MultiHeadTokenMixing(num_tokens, hidden_dim)
+        self.moe = PerTokenMoEFFN(num_tokens, hidden_dim, num_experts, ffn_expansion, l1_lambda)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x):
+        s = self.norm1(self.mixing(x) + x)
+        out, reg = self.moe(s)
+        return self.norm2(out + s), reg
+
+
+# ============================================================
+# RankMixer CTR 模型
+# ============================================================
+
+class RankMixerCTR(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        data_cfg = cfg["data"]
+        emb_cfg = cfg["embedding"]
+        model_cfg = cfg["model"]
+
+        user_emb_dim = emb_cfg["user_emb_dim"]
+        item_emb_dim = emb_cfg["item_emb_dim"]
+        user_vis_dim = data_cfg["user_vis_dim"]
+        item_vis_dim = data_cfg["item_vis_dim"]
+        chunk_size = model_cfg["chunk_size"]
+        hidden_dim = model_cfg["hidden_dim"]
+        num_dense = model_cfg["num_dense_layers"]
+        num_moe = model_cfg["num_moe_layers"]
+        ffn_exp = model_cfg["ffn_expansion"]
+        num_experts = model_cfg["num_experts"]
+        l1_lambda = model_cfg["l1_lambda"]
+
+        self.user_emb = nn.Embedding(data_cfg["num_users"], user_emb_dim)
+        self.item_emb = nn.Embedding(data_cfg["item_hash_size"], item_emb_dim)
+
+        total_dim = user_emb_dim + item_emb_dim + user_vis_dim + item_vis_dim
+        self.num_tokens = math.ceil(total_dim / chunk_size)
+        self.padded_dim = self.num_tokens * chunk_size
+        self.chunk_size = chunk_size
+        self.hidden_dim = hidden_dim
+        self.proj = nn.Linear(chunk_size, hidden_dim)
+
+        T = self.num_tokens
+        print(f"  Feature dim: {total_dim}, Tokens (T): {T}, "
+              f"Hidden (D): {hidden_dim}, D/T: {hidden_dim // T}")
+        print(f"  Dense layers: {num_dense}, MoE layers: {num_moe}, "
+              f"Experts: {num_experts}, FFN expansion: {ffn_exp}")
+
+        self.dense_blocks = nn.ModuleList([
+            RankMixerBlock(T, hidden_dim, ffn_exp) for _ in range(num_dense)
+        ])
+        self.moe_blocks = nn.ModuleList([
+            RankMixerMoEBlock(T, hidden_dim, num_experts, ffn_exp, l1_lambda)
+            for _ in range(num_moe)
+        ])
+        self.output_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, user_ids, item_ids, user_vis, item_vis):
+        u_emb = self.user_emb(user_ids)
+        i_emb = self.item_emb(item_ids)
+        e_input = torch.cat([u_emb, i_emb, user_vis, item_vis], dim=-1)
+
+        B = e_input.size(0)
+        if e_input.size(-1) < self.padded_dim:
+            e_input = F.pad(e_input, (0, self.padded_dim - e_input.size(-1)))
+
+        tokens = e_input.view(B, self.num_tokens, self.chunk_size)
+        x = self.proj(tokens)
+
+        for blk in self.dense_blocks:
+            x = blk(x)
+
+        total_reg = torch.tensor(0.0, device=x.device)
+        for blk in self.moe_blocks:
+            x, reg = blk(x)
+            total_reg = total_reg + reg
+
+        x = x.mean(dim=1)
+        logits = self.output_head(x).squeeze(-1)
+        return logits, total_reg
+
+
+# ============================================================
+# 评估
+# ============================================================
+
+def evaluate(model, dataloader, device):
+    model.eval()
+    all_labels, all_preds = [], []
+    with torch.no_grad():
+        for batch in dataloader:
+            uids, iids, u_vis, i_vis, labels = batch
+            logits, _ = model(
+                uids.to(device), iids.to(device),
+                u_vis.to(device), i_vis.to(device)
+            )
+            probs = torch.sigmoid(logits).cpu().numpy()
+            all_labels.extend(labels.numpy().tolist())
+            all_preds.extend(probs.tolist())
+
+    all_labels = np.array(all_labels)
+    all_preds = np.clip(np.array(all_preds), 1e-7, 1 - 1e-7)
+    return roc_auc_score(all_labels, all_preds), log_loss(all_labels, all_preds)
+
+
+# ============================================================
+# 训练主函数
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config", type=str,
+        default=os.path.join(os.path.dirname(__file__), "config", "kuaivideo_small.yaml"),
+        help="配置文件路径"
+    )
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    device = get_device(cfg.get("device", "auto"))
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(project_root, cfg["data"]["data_dir"])
+    train_cfg = cfg["training"]
+    log_cfg = cfg["logging"]
+
+    print("=" * 60)
+    print("RankMixer on KuaiVideo_x1")
+    print(f"Config: {args.config}")
+    print(f"Device: {device}")
+    print("=" * 60)
+
+    # 打印关键配置
+    print("\n--- Model Config ---")
+    for k, v in cfg["model"].items():
+        print(f"  {k}: {v}")
+    print("\n--- Training Config ---")
+    for k, v in train_cfg.items():
+        print(f"  {k}: {v}")
+
+    # 加载 embedding
+    user_vis_emb, item_vis_emb = load_pretrained_embeddings(cfg)
+
+    # 构建模型
+    print("\n构建模型 ...")
+    model = RankMixerCTR(cfg).to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  总参数量: {total_params / 1e6:.2f}M")
+
+    # 论文理论参数量
+    T = model.num_tokens
+    D = cfg["model"]["hidden_dim"]
+    k = cfg["model"]["ffn_expansion"]
+    L_dense = cfg["model"]["num_dense_layers"]
+    L_moe = cfg["model"]["num_moe_layers"]
+    E = cfg["model"]["num_experts"]
+    dense_theory = 2 * k * L_dense * T * D * D
+    moe_theory = 2 * k * L_moe * T * D * D * E
+    print(f"  论文理论 Dense 参数量 (2kL_dTD²): {dense_theory / 1e6:.2f}M")
+    print(f"  论文理论 MoE 参数量 (2kL_mTD²E): {moe_theory / 1e6:.2f}M")
+
+    # 优化器
+    if train_cfg["optimizer"] == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=train_cfg["learning_rate"],
+            weight_decay=train_cfg["weight_decay"]
+        )
+    else:
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=train_cfg["learning_rate"],
+            weight_decay=train_cfg["weight_decay"]
+        )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=train_cfg["num_epochs"],
+        eta_min=train_cfg["scheduler_eta_min"]
+    )
+    criterion = nn.BCEWithLogitsLoss()
+
+    train_csv = os.path.join(data_dir, cfg["data"]["train_file"])
+    test_csv = os.path.join(data_dir, cfg["data"]["test_file"])
+
+    best_auc = 0.0
+    save_path = os.path.join(project_root, log_cfg["save_path"])
+    warmup_steps = train_cfg.get("warmup_steps", 0)
+
+    for epoch in range(train_cfg["num_epochs"]):
+        print(f"\n{'='*60}")
+        print(f"Epoch {epoch + 1}/{train_cfg['num_epochs']}  "
+              f"(lr={optimizer.param_groups[0]['lr']:.2e})")
+        print(f"{'='*60}")
+
+        train_dataset = KuaiVideoIterDataset(
+            train_csv, user_vis_emb, item_vis_emb, cfg
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_size=train_cfg["batch_size"],
+            collate_fn=collate_fn, num_workers=0,
+        )
+
+        model.train()
+        epoch_loss = 0.0
+        epoch_samples = 0
+        step = 0
+        t0 = time.time()
+        global_step = epoch * 2700  # 大约每 epoch 2700 步
+
+        for batch in train_loader:
+            uids, iids, u_vis, i_vis, labels = batch
+            uids = uids.to(device)
+            iids = iids.to(device)
+            u_vis = u_vis.to(device)
+            i_vis = i_vis.to(device)
+            labels = labels.to(device)
+
+            # Warmup
+            cur_global = global_step + step
+            if warmup_steps > 0 and cur_global < warmup_steps:
+                warmup_lr = train_cfg["learning_rate"] * (cur_global + 1) / warmup_steps
+                for pg in optimizer.param_groups:
+                    pg["lr"] = warmup_lr
+
+            optimizer.zero_grad()
+            logits, reg_loss = model(uids, iids, u_vis, i_vis)
+            bce_loss = criterion(logits, labels)
+            loss = bce_loss + reg_loss
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=train_cfg["grad_clip_norm"]
+            )
+            optimizer.step()
+
+            bs = labels.size(0)
+            epoch_loss += bce_loss.item() * bs
+            epoch_samples += bs
+            step += 1
+
+            if step % log_cfg["log_interval"] == 0:
+                avg = epoch_loss / epoch_samples
+                elapsed = time.time() - t0
+                speed = epoch_samples / elapsed
+                print(
+                    f"  Step {step:5d} | "
+                    f"Samples: {epoch_samples:>8d} | "
+                    f"Loss: {avg:.4f} | "
+                    f"BCE: {bce_loss.item():.4f} | "
+                    f"Reg: {reg_loss.item():.4f} | "
+                    f"Speed: {speed:.0f} s/s | "
+                    f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+                )
+
+        avg_loss = epoch_loss / max(epoch_samples, 1)
+        elapsed = time.time() - t0
+        print(f"\n  Epoch {epoch+1} 训练完成: Loss={avg_loss:.4f}, "
+              f"Samples={epoch_samples}, Time={elapsed:.1f}s")
+
+        scheduler.step()
+
+        # 评估
+        print("\n  评估中 ...")
+        eval_samples = log_cfg["eval_samples"] if log_cfg["eval_samples"] > 0 else None
+        test_dataset = KuaiVideoIterDataset(
+            test_csv, user_vis_emb, item_vis_emb, cfg, max_samples=eval_samples
+        )
+        test_loader = DataLoader(
+            test_dataset, batch_size=train_cfg["batch_size"] * 2,
+            collate_fn=collate_fn, num_workers=0,
+        )
+        auc, logloss = evaluate(model, test_loader, device)
+        print(f"  Test AUC: {auc:.4f} | Test LogLoss: {logloss:.4f}")
+
+        # 保存
+        if log_cfg.get("save_best", True):
+            if auc > best_auc:
+                best_auc = auc
+                torch.save(model.state_dict(), save_path)
+                print(f"  ** 新最佳模型已保存 (AUC={auc:.4f}) → {save_path}")
+        else:
+            torch.save(model.state_dict(), save_path)
+            print(f"  模型已保存 → {save_path}")
+
+    print(f"\n{'='*60}")
+    print(f"训练完成! Best Test AUC: {best_auc:.4f}")
+    print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    main()
