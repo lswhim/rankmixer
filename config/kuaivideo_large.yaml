@@ -62,3 +62,8 @@ logging:
 
 # --- 设备配置 ---
 device: "auto"
+
+# --- wandb 配置 ---
+wandb:
+  project: "rankmixer"
+  tags: ["rankmixer", "large", "dense"]

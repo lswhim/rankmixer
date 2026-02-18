@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset
 from typing import Tuple
 from sklearn.metrics import roc_auc_score, log_loss
+import wandb
 
 
 # ============================================================
@@ -693,6 +694,31 @@ def main():
     model_cfg = cfg["model"]
     arch = model_cfg.get("arch", "rankmixer")
 
+    # --- wandb 初始化 ---
+    wandb_cfg = cfg.get("wandb", {})
+    wandb_project = wandb_cfg.get("project", "rankmixer")
+    wandb_name = wandb_cfg.get("name", None)
+    # 自动生成 run name: arch + config 文件名 (去掉路径和扩展名)
+    if wandb_name is None:
+        config_basename = os.path.splitext(os.path.basename(args.config))[0]
+        wandb_name = config_basename
+    wandb_tags = wandb_cfg.get("tags", [arch])
+
+    wandb.init(
+        project=wandb_project,
+        name=wandb_name,
+        tags=wandb_tags,
+        config={
+            "arch": arch,
+            "model": model_cfg,
+            "training": train_cfg,
+            "data": {k: v for k, v in cfg["data"].items()
+                     if k not in ("data_dir", "train_file", "test_file",
+                                  "user_emb_file", "item_emb_file")},
+            "embedding": cfg["embedding"],
+        },
+    )
+
     print("=" * 60)
     arch_names = {"rankmixer": "RankMixer", "tokenmixer_large": "TokenMixer-Large", "hstu": "HSTU", "transformer": "Transformer"}
     print(f"{arch_names.get(arch, arch)} on KuaiVideo_x1")
@@ -713,6 +739,7 @@ def main():
     model = build_model(cfg).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  总参数量: {total_params / 1e6:.2f}M")
+    wandb.log({"model/total_params_M": total_params / 1e6}, step=0)
 
     # RankMixer 理论参数量
     if arch == "rankmixer":
@@ -748,6 +775,8 @@ def main():
     # TokenMixer-Large 的辅助损失权重
     aux_loss_weight = model_cfg.get("aux_loss_weight", 0.1) if arch == "tokenmixer_large" else 0.0
 
+    global_step = 0
+
     for epoch in range(train_cfg["num_epochs"]):
         print(f"\n{'='*60}")
         print(f"Epoch {epoch + 1}/{train_cfg['num_epochs']}  "
@@ -767,7 +796,6 @@ def main():
         epoch_samples = 0
         step = 0
         t0 = time.time()
-        global_step = epoch * 2700
 
         for batch in train_loader:
             uids, iids, u_vis, i_vis, seq_items, seq_lens, labels = batch
@@ -779,9 +807,8 @@ def main():
             seq_lens = seq_lens.to(device)
             labels = labels.to(device)
 
-            cur_global = global_step + step
-            if warmup_steps > 0 and cur_global < warmup_steps:
-                warmup_lr = train_cfg["learning_rate"] * (cur_global + 1) / warmup_steps
+            if warmup_steps > 0 and global_step < warmup_steps:
+                warmup_lr = train_cfg["learning_rate"] * (global_step + 1) / warmup_steps
                 for pg in optimizer.param_groups:
                     pg["lr"] = warmup_lr
 
@@ -803,7 +830,7 @@ def main():
                 loss = main_loss + aux_output
                 aux_loss = aux_output
             else:
-                # HSTU: 无辅助损失
+                # HSTU / Transformer: 无辅助损失
                 loss = main_loss
                 aux_loss = torch.tensor(0.0)
 
@@ -818,13 +845,23 @@ def main():
             epoch_loss += main_loss.item() * bs
             epoch_samples += bs
             step += 1
+            global_step += 1
+
+            # wandb step-level logging
+            aux_val = aux_loss.item() if torch.is_tensor(aux_loss) else aux_loss
+            wandb.log({
+                "train/loss": loss.item(),
+                "train/main_loss": main_loss.item(),
+                "train/aux_loss": aux_val,
+                "train/lr": optimizer.param_groups[0]["lr"],
+                "train/epoch": epoch + 1,
+            }, step=global_step)
 
             if step % log_cfg["log_interval"] == 0:
                 avg = epoch_loss / epoch_samples
                 elapsed = time.time() - t0
                 speed = epoch_samples / elapsed
                 aux_name = {"tokenmixer_large": "Aux", "rankmixer": "Reg"}.get(arch, "Aux")
-                aux_val = aux_loss.item() if torch.is_tensor(aux_loss) else aux_loss
                 print(
                     f"  Step {step:5d} | "
                     f"Samples: {epoch_samples:>8d} | "
@@ -834,11 +871,22 @@ def main():
                     f"Speed: {speed:.0f} s/s | "
                     f"LR: {optimizer.param_groups[0]['lr']:.2e}"
                 )
+                wandb.log({
+                    "train/avg_loss": avg,
+                    "train/speed_samples_per_sec": speed,
+                }, step=global_step)
 
         avg_loss = epoch_loss / max(epoch_samples, 1)
         elapsed = time.time() - t0
         print(f"\n  Epoch {epoch+1} 训练完成: Loss={avg_loss:.4f}, "
               f"Samples={epoch_samples}, Time={elapsed:.1f}s")
+
+        wandb.log({
+            "epoch/train_loss": avg_loss,
+            "epoch/train_samples": epoch_samples,
+            "epoch/train_time_s": elapsed,
+            "epoch/epoch": epoch + 1,
+        }, step=global_step)
 
         scheduler.step()
 
@@ -854,11 +902,19 @@ def main():
         auc, logloss = evaluate(model, test_loader, device)
         print(f"  Test AUC: {auc:.4f} | Test LogLoss: {logloss:.4f}")
 
+        wandb.log({
+            "eval/auc": auc,
+            "eval/logloss": logloss,
+            "eval/epoch": epoch + 1,
+        }, step=global_step)
+
         if log_cfg.get("save_best", True):
             if auc > best_auc:
                 best_auc = auc
                 torch.save(model.state_dict(), save_path)
                 print(f"  ** 新最佳模型已保存 (AUC={auc:.4f}) → {save_path}")
+                wandb.run.summary["best_auc"] = best_auc
+                wandb.run.summary["best_epoch"] = epoch + 1
         else:
             torch.save(model.state_dict(), save_path)
             print(f"  模型已保存 → {save_path}")
@@ -866,6 +922,9 @@ def main():
     print(f"\n{'='*60}")
     print(f"训练完成! Best Test AUC: {best_auc:.4f}")
     print(f"{'='*60}")
+
+    wandb.run.summary["final_best_auc"] = best_auc
+    wandb.finish()
 
 
 if __name__ == "__main__":
