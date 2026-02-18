@@ -17,6 +17,8 @@ import torch.nn.functional as F
 from typing import List, Tuple, Optional
 import math
 
+from rankmixer import MultiHeadTokenMixing, FeatureTokenizer
+
 
 # ============================================================
 # 1. RMSNorm (替换 LayerNorm)
@@ -108,36 +110,8 @@ class PerTokenSwiGLU(nn.Module):
 # 3. Mixing & Reverting 操作
 # ============================================================
 
-class MixingOperation(nn.Module):
-    """
-    无参数的 Mixing 操作 (与 RankMixer 的 Multi-head Token Mixing 相同)。
-
-    输入 X ∈ R^{T x D}:
-    1. split: [T, H, D/H]
-    2. 转置: H_h = concat(x_1^h, ..., x_T^h) ∈ R^{T*D/H}
-    3. 拼接: H = [H_1; ...; H_H] ∈ R^{H x (T*D/H)}
-
-    当 H=T 时, 输出维度 = [T, T*(D/T)] = [T, D], 与输入一致。
-    本质是 reshape + transpose。
-    """
-    def __init__(self, num_tokens: int, hidden_dim: int):
-        super().__init__()
-        self.T = num_tokens
-        self.H = num_tokens  # H = T
-        self.D = hidden_dim
-        self.head_dim = hidden_dim // num_tokens
-        assert hidden_dim % num_tokens == 0
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """[batch, T, D] -> [batch, H, T*D/H] = [batch, T, D]"""
-        B = x.size(0)
-        # [B, T, H, head_dim]
-        x = x.view(B, self.T, self.H, self.head_dim)
-        # transpose token dim and head dim -> [B, H, T, head_dim]
-        x = x.transpose(1, 2).contiguous()
-        # flatten -> [B, H, T*head_dim] = [B, T, D]
-        x = x.view(B, self.H, self.T * self.head_dim)
-        return x
+# Mixing 操作复用 RankMixer 的 MultiHeadTokenMixing (逻辑完全相同)
+MixingOperation = MultiHeadTokenMixing
 
 
 class RevertingOperation(nn.Module):
