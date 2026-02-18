@@ -1,12 +1,10 @@
 # ============================================================
 # RankMixer-Small on KuaiVideo_x1
-# 参考论文 arXiv:2507.15551 RankMixer-100M 配置
+# 对应论文 arXiv:2507.15551 RankMixer-100M 配置
 #
-# 论文原始配置: T=16, D=768, L=2, ~107M params
-# 本配置适配 KuaiVideo 特征维度 (256d):
-#   chunk_size=16 → T=16, D=768 → D/T=48
-#   L=2 (dense) + 0 (moe), k=4
-#   理论参数量: 2*k*L*T*D² ≈ 2*4*2*16*768² = 150M (含 embedding)
+# 论文配置: T=16, D=768, L=2, k=4, 全 Dense (无 MoE)
+# chunk_size=16 → T = 256/16 = 16, D=768, D/T=48
+# 理论参数量: 2*k*L*T*D² = 2*4*2*16*768² ≈ 150M
 # ============================================================
 
 # --- 数据配置 ---
@@ -28,22 +26,20 @@ embedding:
   item_emb_dim: 64
 
 # --- RankMixer 模型配置 ---
-# 总特征维度 = 64 + 64 + 64 + 64 = 256
-# chunk_size=16 → T = 256/16 = 16
-# hidden_dim=768, D/T = 768/16 = 48
+# 论文 RankMixer-100M: 全 Dense 架构, L=2
 model:
-  chunk_size: 16                         # d: token 切分维度 → T=16
-  hidden_dim: 768                        # D: 隐藏维度
-  num_dense_layers: 2                    # L_dense: 论文 100M 配置 L=2
-  num_moe_layers: 0                      # L_moe: 纯 Dense 版本
-  ffn_expansion: 4                       # k: FFN 扩展倍率
-  num_experts: 8                         # E: MoE 专家数 (moe_layers=0 时不生效)
-  l1_lambda: 0.01                        # λ: MoE L1 正则系数
+  chunk_size: 16                         # d → T=16
+  hidden_dim: 768                        # D
+  num_dense_layers: 2                    # L=2 (全 Dense)
+  num_moe_layers: 0                      # 无 MoE
+  ffn_expansion: 4                       # k
+  num_experts: 8                         # (不生效)
+  l1_lambda: 0.01                        # (不生效)
 
 # --- 训练配置 ---
 training:
-  batch_size: 2048                       # 模型更大, 适当减小 batch
-  learning_rate: 5.0e-4                  # 大模型用更小学习率
+  batch_size: 2048
+  learning_rate: 5.0e-4
   weight_decay: 1.0e-5
   num_epochs: 5
   grad_clip_norm: 1.0

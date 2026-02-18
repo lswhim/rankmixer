@@ -1,16 +1,12 @@
 # ============================================================
 # RankMixer-Large on KuaiVideo_x1
-# 参考论文 arXiv:2507.15551 RankMixer-1B 配置
+# 对应论文 arXiv:2507.15551 RankMixer-1B 配置
 #
-# 论文原始配置: T=32, D=1536, L=2, ~1.1B params (线上部署版)
-# 本配置适配 KuaiVideo 特征维度 (256d):
-#   chunk_size=8 → T=32, D=1536 → D/T=48
-#   L=2 (dense) + 1 (moe, E=8), k=4
-#   理论 Dense 参数量: 2*k*L*T*D² ≈ 2*4*2*32*1536² = 1.21B
-#   理论 MoE 参数量:   2*k*1*T*D²*E ≈ 2*4*1*32*1536²*8 = 4.83B (稀疏激活)
+# 论文配置: T=32, D=1536, L=2, k=4, 全 Dense
+# chunk_size=8 → T = 256/8 = 32, D=1536, D/T=48
+# 理论参数量: 2*k*L*T*D² = 2*4*2*32*1536² ≈ 1.21B
 #
-# 注意: 此配置参数量非常大, 需要足够的 GPU 显存 (建议 ≥24GB)
-#       如在 Mac MPS 上运行, 建议使用 kuaivideo_small.yaml
+# 注意: 此配置参数量 ~1.2B, 需要足够显存 (建议 ≥24GB)
 # ============================================================
 
 # --- 数据配置 ---
@@ -32,29 +28,27 @@ embedding:
   item_emb_dim: 64
 
 # --- RankMixer 模型配置 ---
-# 总特征维度 = 64 + 64 + 64 + 64 = 256
-# chunk_size=8 → T = 256/8 = 32
-# hidden_dim=1536, D/T = 1536/32 = 48
+# 论文 RankMixer-1B: 全 Dense 架构, L=2
 model:
-  chunk_size: 8                          # d: token 切分维度 → T=32
-  hidden_dim: 1536                       # D: 隐藏维度
-  num_dense_layers: 2                    # L_dense: 论文 1B 配置 L=2
-  num_moe_layers: 1                      # L_moe: 带 Sparse-MoE 的 DTSI 层
-  ffn_expansion: 4                       # k: FFN 扩展倍率
-  num_experts: 8                         # E: 每个 token 的专家数
-  l1_lambda: 0.01                        # λ: MoE L1 稀疏正则系数
+  chunk_size: 8                          # d → T=32
+  hidden_dim: 1536                       # D
+  num_dense_layers: 2                    # L=2 (全 Dense)
+  num_moe_layers: 0                      # 无 MoE
+  ffn_expansion: 4                       # k
+  num_experts: 8                         # (不生效)
+  l1_lambda: 0.01                        # (不生效)
 
 # --- 训练配置 ---
 training:
-  batch_size: 1024                       # 大模型需更小 batch (显存约束)
-  learning_rate: 3.0e-4                  # 大模型用更小学习率
+  batch_size: 1024
+  learning_rate: 3.0e-4
   weight_decay: 1.0e-5
   num_epochs: 5
   grad_clip_norm: 1.0
-  optimizer: "adamw"                     # 大模型推荐 AdamW
+  optimizer: "adamw"
   scheduler: "cosine"
   scheduler_eta_min: 1.0e-6
-  warmup_steps: 1000                     # 大模型需更长 warmup
+  warmup_steps: 1000
 
 # --- 日志与评估配置 ---
 logging:
