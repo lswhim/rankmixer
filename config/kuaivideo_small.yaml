@@ -28,6 +28,7 @@ embedding:
 # --- RankMixer 模型配置 ---
 # 论文 RankMixer-100M: 全 Dense 架构, L=2
 model:
+  arch: "rankmixer"
   chunk_size: 16                         # d → T=16
   hidden_dim: 768                        # D
   num_dense_layers: 2                    # L=2 (全 Dense)

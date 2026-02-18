@@ -1,37 +1,56 @@
-# RankMixer
+# RankMixer & TokenMixer-Large
 
-Unofficial implementation of **RankMixer: Scaling Up Ranking Models in Industrial Recommenders** (ByteDance, [arXiv:2507.15551](https://arxiv.org/abs/2507.15551)).
+Unofficial implementation of:
+- **RankMixer: Scaling Up Ranking Models in Industrial Recommenders** (ByteDance, [arXiv:2507.15551](https://arxiv.org/abs/2507.15551))
+- **TokenMixer-Large: Scaling Up Large Ranking Models in Industrial Recommenders** (ByteDance, [arXiv:2602.06563](https://arxiv.org/abs/2602.06563))
 
 ## Architecture
 
-RankMixer replaces diverse handcrafted feature-interaction modules with a unified, scalable architecture:
+### RankMixer (v1)
 
 ```
-Input Features → Semantic Grouping → Chunking (d) → T Tokens → Proj(D)
-                                                          ↓
-                                                  ┌───────────────┐
-                                                  │ RankMixer Block │ × L
-                                                  │  ├─ Multi-head  │
-                                                  │  │  Token Mixing│
-                                                  │  └─ Per-token   │
-                                                  │     FFN / MoE   │
-                                                  └───────────────┘
-                                                          ↓
-                                                  Mean Pooling → Output
+Input Features → Chunking (d) → T Tokens → Proj(D)
+                                      ↓
+                              ┌───────────────┐
+                              │ RankMixer Block │ × L
+                              │  ├─ Token Mixing│  (parameter-free)
+                              │  └─ Per-token   │
+                              │     FFN (GELU)  │
+                              └───────────────┘
+                                      ↓
+                              Mean Pooling → Output
 ```
 
-**Key components:**
-- **Multi-head Token Mixing**: Parameter-free reshape + transpose (H=T), replaces self-attention
-- **Per-token FFN**: Each token has independent FFN parameters (not shared)
-- **Sparse-MoE variant**: ReLU Routing + DTSI (Dense-Train / Sparse-Infer), replaces Dense FFN
+### TokenMixer-Large (v2, improved)
 
-**Scaling directions** (orthogonal):
-- `T` — number of feature tokens
-- `D` — hidden dimension
-- `L` — number of layers
-- `E` — number of experts (MoE variant)
+```
+Input Features → Semantic Group Tokenizer → T Tokens + Global Token → Proj(D)
+                                                      ↓
+                                        ┌─────────────────────────┐
+                                        │ TokenMixer-Large Block   │ × L
+                                        │  ├─ Mixing (reshape)     │
+                                        │  ├─ pSwiGLU + Pre-Norm   │
+                                        │  ├─ Reverting (reshape)   │
+                                        │  └─ pSwiGLU + Pre-Norm   │
+                                        │  + Inter-layer Residual   │
+                                        │  + Auxiliary Loss         │
+                                        └─────────────────────────┘
+                                                      ↓
+                                          Global Token → Output
+```
 
-**Parameter formula**: `#Param ≈ 2kLTD²` (Dense), `FLOPs ≈ 4kLTD²`
+**Key improvements in TokenMixer-Large over RankMixer:**
+
+| Aspect | RankMixer | TokenMixer-Large |
+|--------|-----------|-----------------|
+| Block design | Token Mixing + FFN | Mixing & Reverting (aligned residuals) |
+| FFN | Per-token GELU FFN | Per-token SwiGLU (gate/up/down) |
+| Normalization | LayerNorm, Post-Norm | RMSNorm, Pre-Norm |
+| Init | Standard | Down-matrix Small Init (σ=0.01) |
+| Depth support | L=2 (shallow) | L=4+ with Inter-layer Residual + Aux Loss |
+| Output | Mean Pooling | Global Token (like BERT [CLS]) |
+| MoE routing | ReLU + DTSI | Top-k Softmax + Shared Expert + α scaling |
+| MoE training | Dense-Train / Sparse-Infer | Sparse-Train / Sparse-Infer |
 
 ## Dataset
 
@@ -50,66 +69,83 @@ Input Features → Semantic Grouping → Chunking (d) → T Tokens → Proj(D)
 python prepare_data.py
 ```
 
-Downloads `KuaiVideo_x1.zip` (~2.27GB) from HuggingFace and extracts it.
-
-### 2. Train
+### 2. Train RankMixer
 
 ```bash
-# RankMixer-Small (Dense, ~150M params) — 对应论文 RankMixer-100M
+# Small (Dense, ~150M) — 论文 RankMixer-100M
 python train_kuaivideo.py --config config/kuaivideo_small.yaml
 
-# RankMixer-Middle (MoE, E=8) — Sparse-MoE 扩展实验
+# Middle (MoE, E=8) — Sparse-MoE 扩展实验
 python train_kuaivideo.py --config config/kuaivideo_middle.yaml
 
-# RankMixer-Large (Dense, ~1.2B params) — 对应论文 RankMixer-1B
+# Large (Dense, ~1.2B) — 论文 RankMixer-1B
 python train_kuaivideo.py --config config/kuaivideo_large.yaml
+```
+
+### 3. Train TokenMixer-Large
+
+```bash
+# Small (Dense, L=4)
+python train_kuaivideo.py --config config/tokenmixer_small.yaml
+
+# Middle (MoE, L=4, E=8, top_k=2)
+python train_kuaivideo.py --config config/tokenmixer_middle.yaml
 ```
 
 ## Model Configurations
 
-| Config | T | D | L | FFN Type | E | ~Params | Paper Reference |
-|--------|---|---|---|----------|---|---------|-----------------|
-| `kuaivideo_small.yaml` | 16 | 768 | 2 | Dense | — | 150M | RankMixer-100M |
-| `kuaivideo_middle.yaml` | 16 | 1024 | 2 | Sparse-MoE | 8 | — | MoE extension (Sec 4.5) |
-| `kuaivideo_large.yaml` | 32 | 1536 | 2 | Dense | — | 1.2B | RankMixer-1B |
+### RankMixer
 
-> **Note**: Dense and MoE are **alternatives** (not stacked). MoE replaces the Per-token FFN with Sparse Mixture-of-Experts using ReLU routing.
+| Config | T | D | L | FFN Type | E | Paper Reference |
+|--------|---|---|---|----------|---|-----------------|
+| `kuaivideo_small.yaml` | 16 | 768 | 2 | Dense | — | RankMixer-100M |
+| `kuaivideo_middle.yaml` | 16 | 1024 | 2 | Sparse-MoE | 8 | MoE extension |
+| `kuaivideo_large.yaml` | 32 | 1536 | 2 | Dense | — | RankMixer-1B |
+
+### TokenMixer-Large
+
+| Config | T+1 | D | L | FFN Type | E | top_k |
+|--------|-----|---|---|----------|---|-------|
+| `tokenmixer_small.yaml` | 17 | 544 | 4 | Dense pSwiGLU | — | — |
+| `tokenmixer_middle.yaml` | 17 | 544 | 4 | Sparse-Pertoken MoE | 8 | 2 |
 
 ## Project Structure
 
 ```
 rankmixer/
-├── rankmixer.py              # Core model implementation
-├── train_kuaivideo.py        # Training script (loads config from YAML)
+├── rankmixer.py              # RankMixer model (v1)
+├── tokenmixer_large.py       # TokenMixer-Large model (v2)
+├── train_kuaivideo.py        # Unified training script (auto-selects model by config)
 ├── prepare_data.py           # Download & extract dataset
 ├── config/
-│   ├── kuaivideo_small.yaml  # RankMixer-100M (Dense)
-│   ├── kuaivideo_middle.yaml # MoE extension experiment
-│   └── kuaivideo_large.yaml  # RankMixer-1B (Dense)
-└── KuaiVideo_x1/             # Dataset (after prepare_data.py)
-    ├── train.csv
-    ├── test.csv
-    ├── user_visual_emb_dim64.h5
-    └── item_visual_emb_dim64.h5
+│   ├── kuaivideo_small.yaml  # RankMixer configs
+│   ├── kuaivideo_middle.yaml
+│   ├── kuaivideo_large.yaml
+│   ├── tokenmixer_small.yaml # TokenMixer-Large configs
+│   └── tokenmixer_middle.yaml
+└── KuaiVideo_x1/             # Dataset
 ```
 
 ## Requirements
-
-- Python 3.8+
-- PyTorch
-- h5py, pyyaml, scikit-learn, numpy
 
 ```bash
 pip install torch h5py pyyaml scikit-learn numpy
 ```
 
-## Reference
+## References
 
 ```bibtex
 @article{rankmixer2025,
   title={RankMixer: Scaling Up Ranking Models in Industrial Recommenders},
   author={ByteDance},
   journal={arXiv preprint arXiv:2507.15551},
+  year={2025}
+}
+
+@article{tokenmixerlarge2025,
+  title={TokenMixer-Large: Scaling Up Large Ranking Models in Industrial Recommenders},
+  author={ByteDance},
+  journal={arXiv preprint arXiv:2602.06563},
   year={2025}
 }
 ```

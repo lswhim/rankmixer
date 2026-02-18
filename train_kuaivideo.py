@@ -1,6 +1,9 @@
 """
-使用 RankMixer 在 KuaiVideo_x1 数据集上进行 CTR 预测训练
-所有超参数通过 config/kuaivideo.yaml 加载
+在 KuaiVideo_x1 数据集上进行 CTR 预测训练
+支持两种模型架构:
+  - RankMixer (arXiv:2507.15551)
+  - TokenMixer-Large (arXiv:2602.06563)
+通过 config YAML 中的 model.arch 字段选择
 """
 
 import os
@@ -128,7 +131,7 @@ def collate_fn(batch):
 
 
 # ============================================================
-# 模型组件
+# RankMixer 模型组件 (arXiv:2507.15551)
 # ============================================================
 
 class MultiHeadTokenMixing(nn.Module):
@@ -276,7 +279,7 @@ class RankMixerCTR(nn.Module):
         self.proj = nn.Linear(chunk_size, hidden_dim)
 
         T = self.num_tokens
-        print(f"  Feature dim: {total_dim}, Tokens (T): {T}, "
+        print(f"  [RankMixer] Feature dim: {total_dim}, Tokens (T): {T}, "
               f"Hidden (D): {hidden_dim}, D/T: {hidden_dim // T}")
         print(f"  Dense layers: {num_dense}, MoE layers: {num_moe}, "
               f"Experts: {num_experts}, FFN expansion: {ffn_exp}")
@@ -316,6 +319,142 @@ class RankMixerCTR(nn.Module):
         x = x.mean(dim=1)
         logits = self.output_head(x).squeeze(-1)
         return logits, total_reg
+
+
+# ============================================================
+# TokenMixer-Large CTR 模型 (arXiv:2602.06563)
+# ============================================================
+
+class TokenMixerLargeCTR(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        from tokenmixer_large import (
+            TokenMixerLargeBlock, TokenMixerLargeMoEBlock, RMSNorm,
+        )
+
+        data_cfg = cfg["data"]
+        emb_cfg = cfg["embedding"]
+        model_cfg = cfg["model"]
+
+        user_emb_dim = emb_cfg["user_emb_dim"]
+        item_emb_dim = emb_cfg["item_emb_dim"]
+        user_vis_dim = data_cfg["user_vis_dim"]
+        item_vis_dim = data_cfg["item_vis_dim"]
+
+        chunk_size = model_cfg["chunk_size"]
+        hidden_dim = model_cfg["hidden_dim"]
+
+        self.user_emb = nn.Embedding(data_cfg["num_users"], user_emb_dim)
+        self.item_emb = nn.Embedding(data_cfg["item_hash_size"], item_emb_dim)
+
+        total_dim = user_emb_dim + item_emb_dim + user_vis_dim + item_vis_dim
+        self.num_tokens = math.ceil(total_dim / chunk_size)
+        self.padded_dim = self.num_tokens * chunk_size
+        self.chunk_size = chunk_size
+        self.hidden_dim = hidden_dim
+
+        T = self.num_tokens
+        T_global = T + 1
+
+        print(f"  [TokenMixer-Large] Feature dim: {total_dim}, Tokens (T): {T}, "
+              f"+1 global = {T_global}")
+        print(f"  Hidden (D): {hidden_dim}, D/(T+1): {hidden_dim // T_global}")
+
+        num_layers = model_cfg["num_layers"]
+        ffn_expansion = model_cfg["ffn_expansion"]
+        use_moe = model_cfg["use_moe"]
+        small_init = model_cfg.get("small_init", True)
+        inter_residual_interval = model_cfg.get("inter_residual_interval", 2)
+        self.inter_residual_interval = inter_residual_interval
+        self.num_layers = num_layers
+        self.aux_loss_weight = model_cfg.get("aux_loss_weight", 0.1)
+
+        print(f"  Layers: {num_layers}, MoE: {use_moe}, "
+              f"Experts: {model_cfg.get('num_experts', '-')}, "
+              f"FFN expansion: {ffn_expansion}")
+
+        self.proj = nn.Linear(chunk_size, hidden_dim)
+
+        self.global_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        nn.init.normal_(self.global_token, std=0.02)
+
+        if use_moe:
+            num_experts = model_cfg["num_experts"]
+            top_k = model_cfg.get("top_k", 2)
+            gate_scale = model_cfg.get("gate_scale", 0.0)
+            self.blocks = nn.ModuleList([
+                TokenMixerLargeMoEBlock(
+                    T_global, hidden_dim, num_experts, top_k,
+                    ffn_expansion, gate_scale, small_init
+                ) for _ in range(num_layers)
+            ])
+        else:
+            self.blocks = nn.ModuleList([
+                TokenMixerLargeBlock(T_global, hidden_dim, ffn_expansion, small_init)
+                for _ in range(num_layers)
+            ])
+
+        self.aux_heads = nn.ModuleDict()
+        for i in range(inter_residual_interval - 1, num_layers - 1, inter_residual_interval):
+            self.aux_heads[str(i)] = nn.Sequential(
+                RMSNorm(hidden_dim),
+                nn.Linear(hidden_dim, 1),
+            )
+
+        self.output_head = nn.Sequential(
+            RMSNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, user_ids, item_ids, user_vis, item_vis):
+        u_emb = self.user_emb(user_ids)
+        i_emb = self.item_emb(item_ids)
+        e_input = torch.cat([u_emb, i_emb, user_vis, item_vis], dim=-1)
+
+        B = e_input.size(0)
+        if e_input.size(-1) < self.padded_dim:
+            e_input = F.pad(e_input, (0, self.padded_dim - e_input.size(-1)))
+
+        tokens = e_input.view(B, self.num_tokens, self.chunk_size)
+        tokens = self.proj(tokens)
+
+        global_t = self.global_token.expand(B, -1, -1)
+        x = torch.cat([global_t, tokens], dim=1)
+
+        aux_logits_list = []
+        residual_cache = x
+
+        for i, block in enumerate(self.blocks):
+            x = block(x)
+
+            if (i + 1) % self.inter_residual_interval == 0 and i < self.num_layers - 1:
+                x = x + residual_cache
+                residual_cache = x
+
+                if str(i) in self.aux_heads:
+                    aux_logit = self.aux_heads[str(i)](x[:, 0, :]).squeeze(-1)
+                    aux_logits_list.append(aux_logit)
+
+        main_logits = self.output_head(x[:, 0, :]).squeeze(-1)
+
+        if aux_logits_list and self.training:
+            aux_logits = torch.stack(aux_logits_list, dim=0).mean(dim=0)
+        else:
+            aux_logits = torch.zeros_like(main_logits)
+
+        return main_logits, aux_logits
+
+
+# ============================================================
+# 构建模型 (统一入口)
+# ============================================================
+
+def build_model(cfg) -> nn.Module:
+    arch = cfg["model"].get("arch", "rankmixer")
+    if arch == "tokenmixer_large":
+        return TokenMixerLargeCTR(cfg)
+    else:
+        return RankMixerCTR(cfg)
 
 
 # ============================================================
@@ -360,53 +499,46 @@ def main():
     data_dir = os.path.join(project_root, cfg["data"]["data_dir"])
     train_cfg = cfg["training"]
     log_cfg = cfg["logging"]
+    model_cfg = cfg["model"]
+    arch = model_cfg.get("arch", "rankmixer")
 
     print("=" * 60)
-    print("RankMixer on KuaiVideo_x1")
+    print(f"{'TokenMixer-Large' if arch == 'tokenmixer_large' else 'RankMixer'} on KuaiVideo_x1")
     print(f"Config: {args.config}")
     print(f"Device: {device}")
     print("=" * 60)
 
-    # 打印关键配置
     print("\n--- Model Config ---")
-    for k, v in cfg["model"].items():
+    for k, v in model_cfg.items():
         print(f"  {k}: {v}")
     print("\n--- Training Config ---")
     for k, v in train_cfg.items():
         print(f"  {k}: {v}")
 
-    # 加载 embedding
     user_vis_emb, item_vis_emb = load_pretrained_embeddings(cfg)
 
-    # 构建模型
     print("\n构建模型 ...")
-    model = RankMixerCTR(cfg).to(device)
+    model = build_model(cfg).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  总参数量: {total_params / 1e6:.2f}M")
 
-    # 论文理论参数量
-    T = model.num_tokens
-    D = cfg["model"]["hidden_dim"]
-    k = cfg["model"]["ffn_expansion"]
-    L_dense = cfg["model"]["num_dense_layers"]
-    L_moe = cfg["model"]["num_moe_layers"]
-    E = cfg["model"]["num_experts"]
-    dense_theory = 2 * k * L_dense * T * D * D
-    moe_theory = 2 * k * L_moe * T * D * D * E
-    print(f"  论文理论 Dense 参数量 (2kL_dTD²): {dense_theory / 1e6:.2f}M")
-    print(f"  论文理论 MoE 参数量 (2kL_mTD²E): {moe_theory / 1e6:.2f}M")
+    # RankMixer 理论参数量
+    if arch == "rankmixer":
+        T = model.num_tokens
+        D = model_cfg["hidden_dim"]
+        k = model_cfg["ffn_expansion"]
+        L_dense = model_cfg["num_dense_layers"]
+        L_moe = model_cfg["num_moe_layers"]
+        E = model_cfg["num_experts"]
+        dense_theory = 2 * k * L_dense * T * D * D
+        moe_theory = 2 * k * L_moe * T * D * D * E
+        print(f"  论文理论 Dense 参数量 (2kL_dTD²): {dense_theory / 1e6:.2f}M")
+        print(f"  论文理论 MoE 参数量 (2kL_mTD²E): {moe_theory / 1e6:.2f}M")
 
-    # 优化器
-    if train_cfg["optimizer"] == "adamw":
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=train_cfg["learning_rate"],
-            weight_decay=train_cfg["weight_decay"]
-        )
-    else:
-        optimizer = torch.optim.Adam(
-            model.parameters(), lr=train_cfg["learning_rate"],
-            weight_decay=train_cfg["weight_decay"]
-        )
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=train_cfg["learning_rate"],
+        weight_decay=train_cfg["weight_decay"]
+    )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=train_cfg["num_epochs"],
@@ -420,6 +552,9 @@ def main():
     best_auc = 0.0
     save_path = os.path.join(project_root, log_cfg["save_path"])
     warmup_steps = train_cfg.get("warmup_steps", 0)
+
+    # TokenMixer-Large 的辅助损失权重
+    aux_loss_weight = model_cfg.get("aux_loss_weight", 0.1) if arch == "tokenmixer_large" else 0.0
 
     for epoch in range(train_cfg["num_epochs"]):
         print(f"\n{'='*60}")
@@ -440,7 +575,7 @@ def main():
         epoch_samples = 0
         step = 0
         t0 = time.time()
-        global_step = epoch * 2700  # 大约每 epoch 2700 步
+        global_step = epoch * 2700
 
         for batch in train_loader:
             uids, iids, u_vis, i_vis, labels = batch
@@ -450,7 +585,6 @@ def main():
             i_vis = i_vis.to(device)
             labels = labels.to(device)
 
-            # Warmup
             cur_global = global_step + step
             if warmup_steps > 0 and cur_global < warmup_steps:
                 warmup_lr = train_cfg["learning_rate"] * (cur_global + 1) / warmup_steps
@@ -458,9 +592,23 @@ def main():
                     pg["lr"] = warmup_lr
 
             optimizer.zero_grad()
-            logits, reg_loss = model(uids, iids, u_vis, i_vis)
-            bce_loss = criterion(logits, labels)
-            loss = bce_loss + reg_loss
+            main_logits, aux_output = model(uids, iids, u_vis, i_vis)
+
+            main_loss = criterion(main_logits, labels)
+
+            if arch == "tokenmixer_large":
+                # aux_output 是辅助 logits
+                if aux_output.abs().sum() > 0:
+                    aux_loss = criterion(aux_output, labels)
+                    loss = main_loss + aux_loss_weight * aux_loss
+                else:
+                    loss = main_loss
+                    aux_loss = torch.tensor(0.0)
+            else:
+                # aux_output 是 MoE L1 正则损失
+                loss = main_loss + aux_output
+                aux_loss = aux_output
+
             loss.backward()
 
             torch.nn.utils.clip_grad_norm_(
@@ -469,7 +617,7 @@ def main():
             optimizer.step()
 
             bs = labels.size(0)
-            epoch_loss += bce_loss.item() * bs
+            epoch_loss += main_loss.item() * bs
             epoch_samples += bs
             step += 1
 
@@ -477,12 +625,14 @@ def main():
                 avg = epoch_loss / epoch_samples
                 elapsed = time.time() - t0
                 speed = epoch_samples / elapsed
+                aux_name = "Aux" if arch == "tokenmixer_large" else "Reg"
+                aux_val = aux_loss.item() if torch.is_tensor(aux_loss) else aux_loss
                 print(
                     f"  Step {step:5d} | "
                     f"Samples: {epoch_samples:>8d} | "
                     f"Loss: {avg:.4f} | "
-                    f"BCE: {bce_loss.item():.4f} | "
-                    f"Reg: {reg_loss.item():.4f} | "
+                    f"Main: {main_loss.item():.4f} | "
+                    f"{aux_name}: {aux_val:.4f} | "
                     f"Speed: {speed:.0f} s/s | "
                     f"LR: {optimizer.param_groups[0]['lr']:.2e}"
                 )
@@ -494,7 +644,6 @@ def main():
 
         scheduler.step()
 
-        # 评估
         print("\n  评估中 ...")
         eval_samples = log_cfg["eval_samples"] if log_cfg["eval_samples"] > 0 else None
         test_dataset = KuaiVideoIterDataset(
@@ -507,7 +656,6 @@ def main():
         auc, logloss = evaluate(model, test_loader, device)
         print(f"  Test AUC: {auc:.4f} | Test LogLoss: {logloss:.4f}")
 
-        # 保存
         if log_cfg.get("save_best", True):
             if auc > best_auc:
                 best_auc = auc
