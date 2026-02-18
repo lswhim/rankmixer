@@ -131,118 +131,13 @@ def collate_fn(batch):
 
 
 # ============================================================
-# RankMixer 模型组件 (arXiv:2507.15551)
+# RankMixer 模型组件 (从 rankmixer.py 导入)
 # ============================================================
 
-class MultiHeadTokenMixing(nn.Module):
-    def __init__(self, num_tokens, hidden_dim):
-        super().__init__()
-        self.T = num_tokens
-        self.D = hidden_dim
-        self.head_dim = hidden_dim // num_tokens
-        assert hidden_dim % num_tokens == 0
-
-    def forward(self, x):
-        B = x.size(0)
-        x = x.view(B, self.T, self.T, self.head_dim)
-        x = x.transpose(1, 2).contiguous()
-        x = x.view(B, self.T, self.D)
-        return x
-
-
-class PerTokenFFN(nn.Module):
-    def __init__(self, num_tokens, hidden_dim, expansion=4):
-        super().__init__()
-        kD = hidden_dim * expansion
-        self.W1 = nn.Parameter(torch.empty(num_tokens, hidden_dim, kD))
-        self.b1 = nn.Parameter(torch.zeros(num_tokens, kD))
-        self.W2 = nn.Parameter(torch.empty(num_tokens, kD, hidden_dim))
-        self.b2 = nn.Parameter(torch.zeros(num_tokens, hidden_dim))
-        for i in range(num_tokens):
-            nn.init.kaiming_uniform_(self.W1[i], a=math.sqrt(5))
-            nn.init.kaiming_uniform_(self.W2[i], a=math.sqrt(5))
-
-    def forward(self, x):
-        h = torch.einsum('btd,tdh->bth', x, self.W1) + self.b1
-        h = F.gelu(h)
-        return torch.einsum('bth,thd->btd', h, self.W2) + self.b2
-
-
-class ReLURouter(nn.Module):
-    def __init__(self, hidden_dim, num_experts):
-        super().__init__()
-        self.gate = nn.Linear(hidden_dim, num_experts)
-
-    def forward(self, x):
-        return F.relu(self.gate(x))
-
-
-class PerTokenMoEFFN(nn.Module):
-    def __init__(self, num_tokens, hidden_dim, num_experts, ffn_expansion, l1_lambda):
-        super().__init__()
-        self.T = num_tokens
-        self.num_experts = num_experts
-        self.l1_lambda = l1_lambda
-        kD = hidden_dim * ffn_expansion
-
-        self.W1 = nn.Parameter(torch.empty(num_tokens, num_experts, hidden_dim, kD))
-        self.b1 = nn.Parameter(torch.zeros(num_tokens, num_experts, kD))
-        self.W2 = nn.Parameter(torch.empty(num_tokens, num_experts, kD, hidden_dim))
-        self.b2 = nn.Parameter(torch.zeros(num_tokens, num_experts, hidden_dim))
-
-        for t in range(num_tokens):
-            for e in range(num_experts):
-                nn.init.kaiming_uniform_(self.W1[t, e], a=math.sqrt(5))
-                nn.init.kaiming_uniform_(self.W2[t, e], a=math.sqrt(5))
-
-        self.router_train = ReLURouter(hidden_dim, num_experts)
-        self.router_infer = ReLURouter(hidden_dim, num_experts)
-
-    def _expert_forward(self, x, gate):
-        h = torch.einsum('btd,tedk->btek', x, self.W1) + self.b1.unsqueeze(0)
-        h = F.gelu(h)
-        out = torch.einsum('btek,tekd->bted', h, self.W2) + self.b2.unsqueeze(0)
-        return torch.einsum('bte,bted->btd', gate, out)
-
-    def forward(self, x):
-        B, T, D = x.shape
-        if self.training:
-            g_train = self.router_train(x.reshape(-1, D)).view(B, T, self.num_experts)
-            g_infer = self.router_infer(x.reshape(-1, D)).view(B, T, self.num_experts)
-            output = self._expert_forward(x, g_train)
-            reg = self.l1_lambda * g_infer.sum() / (B * T)
-        else:
-            gate = self.router_infer(x.reshape(-1, D)).view(B, T, self.num_experts)
-            output = self._expert_forward(x, gate)
-            reg = torch.tensor(0.0, device=x.device)
-        return output, reg
-
-
-class RankMixerBlock(nn.Module):
-    def __init__(self, num_tokens, hidden_dim, ffn_expansion):
-        super().__init__()
-        self.mixing = MultiHeadTokenMixing(num_tokens, hidden_dim)
-        self.pffn = PerTokenFFN(num_tokens, hidden_dim, ffn_expansion)
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-
-    def forward(self, x):
-        s = self.norm1(self.mixing(x) + x)
-        return self.norm2(self.pffn(s) + s)
-
-
-class RankMixerMoEBlock(nn.Module):
-    def __init__(self, num_tokens, hidden_dim, num_experts, ffn_expansion, l1_lambda):
-        super().__init__()
-        self.mixing = MultiHeadTokenMixing(num_tokens, hidden_dim)
-        self.moe = PerTokenMoEFFN(num_tokens, hidden_dim, num_experts, ffn_expansion, l1_lambda)
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-
-    def forward(self, x):
-        s = self.norm1(self.mixing(x) + x)
-        out, reg = self.moe(s)
-        return self.norm2(out + s), reg
+from rankmixer import (
+    MultiHeadTokenMixing, PerTokenFFN, ReLURouter, PerTokenMoEFFN,
+    RankMixerBlock, RankMixerMoEBlock,
+)
 
 
 # ============================================================

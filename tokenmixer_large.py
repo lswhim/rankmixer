@@ -418,27 +418,16 @@ class TokenMixerLarge(nn.Module):
         self.inter_residual_interval = inter_residual_interval
         self.aux_loss_weight = aux_loss_weight
 
-        # === 输入 Token 化 (复用 RankMixer 的设计) ===
-        self.chunk_size = chunk_size
-        self.hidden_dim = hidden_dim
-
-        self.embeddings = nn.ModuleList([
-            nn.Embedding(vocab, edim)
-            for vocab, edim in zip(feature_dims, embed_dims)
-        ])
-
-        total_embed_dim = sum(embed_dims)
-        self.num_tokens = math.ceil(total_embed_dim / chunk_size)
-        self.padded_dim = self.num_tokens * chunk_size
-        T = self.num_tokens
+        # === 输入 Token 化 (复用 RankMixer 的 FeatureTokenizer) ===
+        self.tokenizer = FeatureTokenizer(
+            feature_dims, embed_dims, chunk_size, hidden_dim
+        )
+        T = self.tokenizer.T
 
         # Global Token (TokenMixer-Large 新增)
         self.global_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         nn.init.normal_(self.global_token, std=0.02)
         self.T_with_global = T + 1  # 加上 global token
-
-        # Projection
-        self.proj = nn.Linear(chunk_size, hidden_dim)
 
         # === Blocks ===
         if use_moe:
@@ -473,7 +462,7 @@ class TokenMixerLarge(nn.Module):
 
     @property
     def T(self) -> int:
-        return self.num_tokens
+        return self.tokenizer.T
 
     def forward(
         self, feature_ids: List[torch.Tensor]
@@ -485,16 +474,9 @@ class TokenMixerLarge(nn.Module):
             logits: [batch, num_classes]
             aux_loss: 辅助损失 (需要在外部与 label 计算 BCE)
         """
-        # 1. Token 化
-        embedded = [emb(fid) for emb, fid in zip(self.embeddings, feature_ids)]
-        e_input = torch.cat(embedded, dim=-1)
-
-        B = e_input.size(0)
-        if e_input.size(-1) < self.padded_dim:
-            e_input = F.pad(e_input, (0, self.padded_dim - e_input.size(-1)))
-
-        tokens = e_input.view(B, self.num_tokens, self.chunk_size)
-        tokens = self.proj(tokens)  # [B, T, D]
+        # 1. Token 化 (复用 FeatureTokenizer)
+        tokens = self.tokenizer(feature_ids)  # [B, T, D]
+        B = tokens.size(0)
 
         # 2. 添加 Global Token
         global_t = self.global_token.expand(B, -1, -1)  # [B, 1, D]
