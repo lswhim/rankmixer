@@ -3,7 +3,8 @@
 # 介于论文 RankMixer-100M 与 RankMixer-1B 之间
 #
 # 配置: T=16, D=1024, L=2, k=4, 全 MoE (Sparse-MoE 扩展)
-# chunk_size=16 → T = 256/16 = 16, D=1024, D/T=64
+# chunk_size=20 → T = 320/20 = 16, D=1024, D/T=64
+# (total_dim = 64*4 + 64(DIN seq) = 320)
 # MoE 替换 Dense FFN, E=8 experts
 # ============================================================
 
@@ -19,6 +20,7 @@ data:
   item_hash_size: 500000
   user_vis_dim: 64
   item_vis_dim: 64
+  max_seq_len: 20
 
 # --- 特征 Embedding 配置 ---
 embedding:
@@ -29,7 +31,7 @@ embedding:
 # 全 MoE 架构: Per-token FFN 替换为 Sparse-MoE
 model:
   arch: "rankmixer"
-  chunk_size: 16                         # d → T=16
+  chunk_size: 20                         # d → T=16
   hidden_dim: 1024                       # D
   num_dense_layers: 0                    # 无 Dense (全部用 MoE 替换)
   num_moe_layers: 2                      # L=2 (全 MoE)

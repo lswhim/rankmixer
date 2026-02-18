@@ -18,6 +18,7 @@ data:
   item_hash_size: 500000
   user_vis_dim: 64
   item_vis_dim: 64
+  max_seq_len: 20
 
 # --- 特征 Embedding 配置 ---
 embedding:
@@ -27,7 +28,7 @@ embedding:
 # --- TokenMixer-Large 模型配置 ---
 model:
   arch: "tokenmixer_large"
-  chunk_size: 16                         # d → T=16, +1 global = 17
+  chunk_size: 20                         # d → T=16, +1 global = 17
   hidden_dim: 544                        # D (544/17=32)
   num_layers: 4                          # L=4
   ffn_expansion: 4                       # n

@@ -3,7 +3,8 @@
 # 对应论文 arXiv:2507.15551 RankMixer-1B 配置
 #
 # 论文配置: T=32, D=1536, L=2, k=4, 全 Dense
-# chunk_size=8 → T = 256/8 = 32, D=1536, D/T=48
+# chunk_size=10 → T = 320/10 = 32, D=1536, D/T=48
+# (total_dim = 64*4 + 64(DIN seq) = 320)
 # 理论参数量: 2*k*L*T*D² = 2*4*2*32*1536² ≈ 1.21B
 #
 # 注意: 此配置参数量 ~1.2B, 需要足够显存 (建议 ≥24GB)
@@ -21,6 +22,7 @@ data:
   item_hash_size: 500000
   user_vis_dim: 64
   item_vis_dim: 64
+  max_seq_len: 20
 
 # --- 特征 Embedding 配置 ---
 embedding:
@@ -31,7 +33,7 @@ embedding:
 # 论文 RankMixer-1B: 全 Dense 架构, L=2
 model:
   arch: "rankmixer"
-  chunk_size: 8                          # d → T=32
+  chunk_size: 10                         # d → T=32
   hidden_dim: 1536                       # D
   num_dense_layers: 2                    # L=2 (全 Dense)
   num_moe_layers: 0                      # 无 MoE

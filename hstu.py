@@ -139,9 +139,11 @@ class HSTULayer(nn.Module):
         # 缩放因子
         self.scale = self.head_dim ** -0.5
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Args: x [batch, T, D]
+        Args:
+            x: [batch, T, D]
+            attn_mask: optional [batch, 1, T, T] bool mask, True = attend
         Returns: [batch, T, D]
         """
         B, T, D = x.shape
@@ -165,8 +167,17 @@ class HSTULayer(nn.Module):
         rel_bias = self.rel_bias(T)  # [H, T, T]
         attn_scores = attn_scores + rel_bias.unsqueeze(0)
 
+        # 应用 attention mask (padding mask)
+        if attn_mask is not None:
+            attn_scores = attn_scores.masked_fill(~attn_mask, 0.0)
+
         # φ2 = SiLU (替代 Softmax!, 保留兴趣强度)
         attn_weights = F.silu(attn_scores)  # [B, H, T, T]
+
+        # 再次 mask (SiLU 输出非零, 需要 re-mask padding)
+        if attn_mask is not None:
+            attn_weights = attn_weights.masked_fill(~attn_mask, 0.0)
+
         attn_weights = self.dropout(attn_weights)
 
         # 加权聚合: [B, H, T, T] @ [B, H, T, d_k] -> [B, H, T, d_k]

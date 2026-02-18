@@ -95,9 +95,11 @@ class KuaiVideoIterDataset(IterableDataset):
         self.num_users = cfg["data"]["num_users"]
         self.item_hash_size = cfg["data"]["item_hash_size"]
         self.max_samples = max_samples
+        self.max_seq_len = cfg["data"].get("max_seq_len", 20)
 
     def __iter__(self):
         count = 0
+        max_seq = self.max_seq_len
         with open(self.csv_path, "r") as f:
             reader = csv.reader(f)
             next(reader)
@@ -111,22 +113,40 @@ class KuaiVideoIterDataset(IterableDataset):
                 iid_hash = item_id % self.item_hash_size
                 user_vis = self.user_vis_emb[uid]
                 item_vis = self.item_vis_emb[iid_hash]
+
+                # 解析 pos_items 行为序列 (col 6, "^" 分隔)
+                raw_pos = row[6] if len(row) > 6 else ""
+                if raw_pos:
+                    pos_ids = [int(x) % self.item_hash_size for x in raw_pos.split("^")]
+                else:
+                    pos_ids = []
+                # 截断到 max_seq_len
+                pos_ids = pos_ids[-max_seq:]  # 取最近的
+                seq_len = len(pos_ids)
+                # pad 到 max_seq_len
+                if seq_len < max_seq:
+                    pos_ids = pos_ids + [0] * (max_seq - seq_len)
+
                 yield (
                     uid, iid_hash,
                     torch.tensor(user_vis, dtype=torch.float32),
                     torch.tensor(item_vis, dtype=torch.float32),
+                    torch.tensor(pos_ids, dtype=torch.long),
+                    seq_len,
                     label,
                 )
                 count += 1
 
 
 def collate_fn(batch):
-    user_ids, item_ids, user_vis, item_vis, labels = zip(*batch)
+    user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens, labels = zip(*batch)
     return (
         torch.tensor(user_ids, dtype=torch.long),
         torch.tensor(item_ids, dtype=torch.long),
         torch.stack(user_vis),
         torch.stack(item_vis),
+        torch.stack(seq_items),                     # [B, max_seq_len]
+        torch.tensor(seq_lens, dtype=torch.long),   # [B]
         torch.tensor(labels, dtype=torch.float32),
     )
 
@@ -142,11 +162,62 @@ from rankmixer import (
 
 
 # ============================================================
-# CTR 模型基类 (公共: embedding + tokenization + proj)
+# DIN Attention (Target-Aware 序列编码)
+# ============================================================
+
+class DINAttention(nn.Module):
+    """
+    Deep Interest Network (DIN) 的 target-aware attention.
+    将用户行为序列编码为一个 target-aware 的 embedding 向量。
+    attention(e_i, e_target) = softmax(MLP(e_i, e_target, e_i - e_target, e_i * e_target))
+    """
+
+    def __init__(self, emb_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        self.attn_mlp = nn.Sequential(
+            nn.Linear(emb_dim * 4, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, seq_emb, target_emb, seq_mask):
+        """
+        Args:
+            seq_emb:    [B, S, E]  序列 item embeddings
+            target_emb: [B, E]     候选 item embedding
+            seq_mask:   [B, S]     bool, True = valid position
+        Returns:
+            out: [B, E]  weighted sum of seq_emb
+        """
+        S = seq_emb.size(1)
+        target_exp = target_emb.unsqueeze(1).expand_as(seq_emb)  # [B, S, E]
+
+        attn_input = torch.cat([
+            seq_emb, target_exp,
+            seq_emb - target_exp,
+            seq_emb * target_exp,
+        ], dim=-1)  # [B, S, 4E]
+
+        attn_score = self.attn_mlp(attn_input).squeeze(-1)  # [B, S]
+
+        # mask padding positions
+        attn_score = attn_score.masked_fill(~seq_mask, float("-inf"))
+
+        # 全为 padding 时 softmax 会 NaN，用 0 代替
+        all_masked = ~seq_mask.any(dim=-1, keepdim=True)  # [B, 1]
+        attn_weight = torch.softmax(attn_score, dim=-1)   # [B, S]
+        attn_weight = attn_weight.masked_fill(all_masked, 0.0)
+
+        out = (attn_weight.unsqueeze(-1) * seq_emb).sum(dim=1)  # [B, E]
+        return out
+
+
+# ============================================================
+# CTR 模型基类 (公共: embedding + DIN序列编码 + tokenization + proj)
 # ============================================================
 
 class BaseCTR(nn.Module):
-    """三个模型共用的 embedding → chunk → proj 流程"""
+    """RankMixer/TokenMixer 共用: embedding → DIN序列编码 → chunk → proj"""
 
     def __init__(self, cfg):
         super().__init__()
@@ -164,7 +235,11 @@ class BaseCTR(nn.Module):
         self.user_emb = nn.Embedding(data_cfg["num_users"], user_emb_dim)
         self.item_emb = nn.Embedding(data_cfg["item_hash_size"], item_emb_dim)
 
-        total_dim = user_emb_dim + item_emb_dim + user_vis_dim + item_vis_dim
+        # DIN 序列注意力: 将行为序列编码为一个 item_emb_dim 维向量
+        self.din_attn = DINAttention(item_emb_dim, hidden_dim=64)
+
+        # total_dim 现在多了一路 seq_emb (item_emb_dim)
+        total_dim = user_emb_dim + item_emb_dim + user_vis_dim + item_vis_dim + item_emb_dim
         self.num_tokens = math.ceil(total_dim / chunk_size)
         self.padded_dim = self.num_tokens * chunk_size
         self.chunk_size = chunk_size
@@ -173,11 +248,20 @@ class BaseCTR(nn.Module):
 
         self.proj = nn.Linear(chunk_size, hidden_dim)
 
-    def _tokenize(self, user_ids, item_ids, user_vis, item_vis):
-        """公共前处理: embedding → concat → pad → chunk → proj → [B, T, D]"""
-        u_emb = self.user_emb(user_ids)
-        i_emb = self.item_emb(item_ids)
-        e_input = torch.cat([u_emb, i_emb, user_vis, item_vis], dim=-1)
+    def _tokenize(self, user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens):
+        """
+        公共前处理:
+        embedding → DIN序列编码 → concat → pad → chunk → proj → [B, T, D]
+        """
+        u_emb = self.user_emb(user_ids)       # [B, user_emb_dim]
+        i_emb = self.item_emb(item_ids)       # [B, item_emb_dim]
+
+        # DIN: 行为序列编码
+        seq_emb_lookup = self.item_emb(seq_items)   # [B, S, item_emb_dim]
+        seq_mask = torch.arange(seq_items.size(1), device=seq_items.device).unsqueeze(0) < seq_lens.unsqueeze(1)
+        seq_enc = self.din_attn(seq_emb_lookup, i_emb, seq_mask)  # [B, item_emb_dim]
+
+        e_input = torch.cat([u_emb, i_emb, user_vis, item_vis, seq_enc], dim=-1)
 
         B = e_input.size(0)
         if e_input.size(-1) < self.padded_dim:
@@ -221,8 +305,8 @@ class RankMixerCTR(BaseCTR):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, user_ids, item_ids, user_vis, item_vis):
-        x = self._tokenize(user_ids, item_ids, user_vis, item_vis)
+    def forward(self, user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens):
+        x = self._tokenize(user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens)
 
         for blk in self.dense_blocks:
             x = blk(x)
@@ -301,8 +385,8 @@ class TokenMixerLargeCTR(BaseCTR):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, user_ids, item_ids, user_vis, item_vis):
-        tokens = self._tokenize(user_ids, item_ids, user_vis, item_vis)
+    def forward(self, user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens):
+        tokens = self._tokenize(user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens)
         B = tokens.size(0)
 
         global_t = self.global_token.expand(B, -1, -1)
@@ -334,28 +418,72 @@ class TokenMixerLargeCTR(BaseCTR):
 
 # ============================================================
 # HSTU CTR 模型 (arXiv:2402.17152)
+# 原文做法: Content-Action 交替序列 + Target-Aware Attention
+# 不继承 BaseCTR, 独立实现序列输入
 # ============================================================
 
-class HSTUCTR(BaseCTR):
+class HSTUCTR(nn.Module):
+    """
+    HSTU 序列转导模型 (忠实于原文)
+
+    输入序列构造:
+      [Φ_0, a_0, Φ_1, a_1, ..., Φ_{k-1}, a_{k-1}, Φ_target]
+    其中:
+      - Φ_i = 历史交互 item 的 embedding (content token)
+      - a_i = 对应行为的 embedding (action token, 这里统一为 click)
+      - Φ_target = 当前候选 item (放在末尾)
+
+    用户特征 (user_emb + user_vis) 作为序列的第一个 prefix token。
+    输出取 Φ_target 位置 (最后一个 token) 的 hidden state。
+    """
+
     def __init__(self, cfg):
-        super().__init__(cfg)
+        super().__init__()
         from hstu import HSTULayer, RMSNorm as HSTURMSNorm
 
+        data_cfg = cfg["data"]
+        emb_cfg = cfg["embedding"]
         model_cfg = cfg["model"]
-        T = self.num_tokens
-        hidden_dim = self.hidden_dim
 
+        user_emb_dim = emb_cfg["user_emb_dim"]
+        item_emb_dim = emb_cfg["item_emb_dim"]
+        user_vis_dim = data_cfg["user_vis_dim"]
+        item_vis_dim = data_cfg["item_vis_dim"]
+        hidden_dim = model_cfg["hidden_dim"]
         num_layers = model_cfg["num_layers"]
         num_heads = model_cfg["num_heads"]
         ffn_expansion = model_cfg.get("ffn_expansion", 4)
         dropout = model_cfg.get("dropout", 0.0)
+        max_seq_len = data_cfg.get("max_seq_len", 20)
 
-        print(f"  [HSTU] Feature dim: {self.total_dim}, Tokens (T): {T}, "
-              f"Hidden (D): {hidden_dim}, Heads: {num_heads}, Head dim: {hidden_dim // num_heads}")
-        print(f"  Layers: {num_layers}, FFN expansion: {ffn_expansion}, "
-              f"Dropout: {dropout}")
+        self.hidden_dim = hidden_dim
 
-        max_tokens = T + 16
+        # Embeddings
+        self.user_emb = nn.Embedding(data_cfg["num_users"], user_emb_dim)
+        self.item_emb = nn.Embedding(data_cfg["item_hash_size"], item_emb_dim)
+
+        # Action embedding: 目前 pos_items 都是 click, 用一个可学习的 action token
+        # 预留多种 action type (click=0, like=1, follow=2, skip=3)
+        num_action_types = 4
+        self.action_emb = nn.Embedding(num_action_types, item_emb_dim)
+
+        # 投影层: content token (item_emb + item_vis → hidden_dim)
+        self.content_proj = nn.Linear(item_emb_dim + item_vis_dim, hidden_dim)
+        # 投影层: action token (item_emb_dim → hidden_dim)
+        self.action_proj = nn.Linear(item_emb_dim, hidden_dim)
+        # 投影层: user prefix token (user_emb + user_vis → hidden_dim)
+        self.user_proj = nn.Linear(user_emb_dim + user_vis_dim, hidden_dim)
+
+        # 序列最长: 1 (user prefix) + max_seq_len * 2 (content+action) + 1 (target)
+        max_tokens = 1 + max_seq_len * 2 + 1 + 8  # 留余量
+        self.max_seq_len = max_seq_len
+
+        print(f"  [HSTU] Hidden (D): {hidden_dim}, Heads: {num_heads}, "
+              f"Head dim: {hidden_dim // num_heads}")
+        print(f"  Layers: {num_layers}, Max seq tokens: {max_tokens}, "
+              f"FFN expansion: {ffn_expansion}, Dropout: {dropout}")
+
+        # HSTU Layers
         self.layers = nn.ModuleList([
             HSTULayer(
                 hidden_dim=hidden_dim,
@@ -372,14 +500,75 @@ class HSTUCTR(BaseCTR):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, user_ids, item_ids, user_vis, item_vis):
-        x = self._tokenize(user_ids, item_ids, user_vis, item_vis)
+    def forward(self, user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens):
+        """
+        构造 Content-Action 交替序列并通过 HSTU Layers。
+        取最后一个 token (target content) 的输出做预测。
+        """
+        B = user_ids.size(0)
+        device = user_ids.device
+        S = seq_items.size(1)  # max_seq_len
 
+        # --- 构造各种 token ---
+        # 1. User prefix token: [B, hidden_dim]
+        u_emb = self.user_emb(user_ids)                            # [B, user_emb_dim]
+        user_token = self.user_proj(torch.cat([u_emb, user_vis], dim=-1))  # [B, D]
+
+        # 2. Content tokens for history: item_emb + item_vis
+        seq_item_emb = self.item_emb(seq_items)                    # [B, S, item_emb_dim]
+        # 历史 item 的 visual embedding: 需要通过 item_vis_emb 查表
+        # 但训练时 item_vis_emb 不在 GPU 上，所以用零代替历史 item 的 vis
+        # (原文也没有要求历史 item 必须有 vis feature)
+        seq_vis_placeholder = torch.zeros(B, S, item_vis.size(-1), device=device)
+        seq_content_input = torch.cat([seq_item_emb, seq_vis_placeholder], dim=-1)  # [B, S, emb+vis]
+        seq_content_tokens = self.content_proj(seq_content_input)  # [B, S, D]
+
+        # 3. Action tokens for history (all click = 0)
+        action_ids = torch.zeros(B, S, dtype=torch.long, device=device)
+        seq_action_tokens = self.action_proj(self.action_emb(action_ids))  # [B, S, D]
+
+        # 4. Target content token: item_emb + item_vis
+        i_emb = self.item_emb(item_ids)                            # [B, item_emb_dim]
+        target_token = self.content_proj(torch.cat([i_emb, item_vis], dim=-1))  # [B, D]
+
+        # --- 构造交替序列: [user, Φ_0, a_0, Φ_1, a_1, ..., Φ_target] ---
+        # 交织 content 和 action: [B, S*2, D]
+        interleaved = torch.stack([seq_content_tokens, seq_action_tokens], dim=2)
+        interleaved = interleaved.view(B, S * 2, self.hidden_dim)  # [B, 2S, D]
+
+        # 拼接: [user_token(1), interleaved(2S), target_token(1)] = [B, 2S+2, D]
+        full_seq = torch.cat([
+            user_token.unsqueeze(1),       # [B, 1, D]
+            interleaved,                   # [B, 2S, D]
+            target_token.unsqueeze(1),     # [B, 1, D]
+        ], dim=1)  # [B, 2S+2, D]
+
+        # --- 构造 attention mask ---
+        # valid 长度: 1 (user) + seq_len*2 (content+action pairs) + 1 (target)
+        valid_lens = 1 + seq_lens * 2 + 1  # [B]
+        total_len = full_seq.size(1)       # 2S+2
+
+        # padding mask: [B, total_len], True = valid
+        pos_indices = torch.arange(total_len, device=device).unsqueeze(0)  # [1, total_len]
+        padding_mask = pos_indices < valid_lens.unsqueeze(1)                # [B, total_len]
+
+        # attention mask: [B, 1, total_len, total_len]
+        # 每个 token 只能 attend 到 valid (非 padding) 的位置
+        attn_mask = padding_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, total_len]
+        attn_mask = attn_mask.expand(B, 1, total_len, total_len)  # [B, 1, T, T]
+
+        # --- HSTU Layers ---
+        x = full_seq
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, attn_mask=attn_mask)
 
-        x = x.mean(dim=1)
-        logits = self.output_head(x).squeeze(-1)
+        # --- 取 target 位置的输出 ---
+        # target 位置 = valid_lens - 1 (最后一个 valid token)
+        target_idx = (valid_lens - 1).unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
+        target_idx = target_idx.expand(B, 1, self.hidden_dim)     # [B, 1, D]
+        target_hidden = x.gather(1, target_idx).squeeze(1)         # [B, D]
+
+        logits = self.output_head(target_hidden).squeeze(-1)
         return logits, torch.tensor(0.0, device=logits.device)
 
 
@@ -406,10 +595,11 @@ def evaluate(model, dataloader, device):
     all_labels, all_preds = [], []
     with torch.no_grad():
         for batch in dataloader:
-            uids, iids, u_vis, i_vis, labels = batch
+            uids, iids, u_vis, i_vis, seq_items, seq_lens, labels = batch
             logits, _ = model(
                 uids.to(device), iids.to(device),
-                u_vis.to(device), i_vis.to(device)
+                u_vis.to(device), i_vis.to(device),
+                seq_items.to(device), seq_lens.to(device),
             )
             probs = torch.sigmoid(logits).cpu().numpy()
             all_labels.extend(labels.numpy().tolist())
@@ -519,11 +709,13 @@ def main():
         global_step = epoch * 2700
 
         for batch in train_loader:
-            uids, iids, u_vis, i_vis, labels = batch
+            uids, iids, u_vis, i_vis, seq_items, seq_lens, labels = batch
             uids = uids.to(device)
             iids = iids.to(device)
             u_vis = u_vis.to(device)
             i_vis = i_vis.to(device)
+            seq_items = seq_items.to(device)
+            seq_lens = seq_lens.to(device)
             labels = labels.to(device)
 
             cur_global = global_step + step
@@ -533,7 +725,7 @@ def main():
                     pg["lr"] = warmup_lr
 
             optimizer.zero_grad()
-            main_logits, aux_output = model(uids, iids, u_vis, i_vis)
+            main_logits, aux_output = model(uids, iids, u_vis, i_vis, seq_items, seq_lens)
 
             main_loss = criterion(main_logits, labels)
 
