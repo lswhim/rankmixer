@@ -1,9 +1,10 @@
-# RankMixer & TokenMixer-Large & HSTU
+# RankMixer & TokenMixer-Large & HSTU & Transformer
 
 Unofficial implementation of:
 - **RankMixer: Scaling Up Ranking Models in Industrial Recommenders** (ByteDance, [arXiv:2507.15551](https://arxiv.org/abs/2507.15551))
 - **TokenMixer-Large: Scaling Up Large Ranking Models in Industrial Recommenders** (ByteDance, [arXiv:2602.06563](https://arxiv.org/abs/2602.06563))
 - **Actions Speak Louder than Words: Trillion-Parameter Sequential Transducers for Generative Recommendations** (Meta, [arXiv:2402.17152](https://arxiv.org/abs/2402.17152))
+- **Vanilla Transformer** — Standard Pre-LN Transformer baseline for comparison
 
 ## Architecture
 
@@ -57,18 +58,35 @@ Input Features → Chunking (d) → T Tokens → Proj(D)
                               Mean Pooling → Output
 ```
 
+### Vanilla Transformer (Baseline)
+
+```
+Input Features → Chunking (d) → T Tokens → Proj(D)
+                                      ↓
+                              ┌───────────────────────┐
+                              │ Transformer Block      │ × L
+                              │  ├─ Pre-LN             │
+                              │  ├─ Multi-Head Self-   │
+                              │  │   Attention (Softmax)│
+                              │  ├─ Pre-LN             │
+                              │  └─ FFN (GELU)         │
+                              └───────────────────────┘
+                                      ↓
+                              Mean Pooling → Output
+```
+
 **Key differences across models:**
 
-| Aspect | RankMixer | TokenMixer-Large | HSTU |
-|--------|-----------|-----------------|------|
-| Token interaction | Reshape mixing (param-free) | Mixing & Reverting | Multi-head attention (no Softmax) |
-| FFN | Per-token GELU FFN | Per-token SwiGLU | Shared FFN + U gating |
-| Normalization | LayerNorm, Post-Norm | RMSNorm, Pre-Norm | RMSNorm |
-| Attention | None | None | SiLU(QK^T + rel_bias) ⊙ V |
-| Position encoding | None | None | Learned relative bias |
-| Output | Mean Pooling | Global Token | Mean Pooling |
-| MoE | ReLU + DTSI | Top-k + Shared Expert | None |
-| Origin | ByteDance | ByteDance | Meta |
+| Aspect | RankMixer | TokenMixer-Large | HSTU | Transformer |
+|--------|-----------|-----------------|------|-------------|
+| Token interaction | Reshape mixing (param-free) | Mixing & Reverting | Multi-head attention (no Softmax) | Multi-head self-attention (Softmax) |
+| FFN | Per-token GELU FFN | Per-token SwiGLU | Shared FFN + U gating | Per-token GELU FFN |
+| Normalization | LayerNorm, Post-Norm | RMSNorm, Pre-Norm | RMSNorm | LayerNorm, Pre-Norm |
+| Attention | None | None | SiLU(QK^T + rel_bias) ⊙ V | Softmax(QK^T/√d) × V |
+| Position encoding | None | None | Learned relative bias | None |
+| Output | Mean Pooling | Global Token | Mean Pooling | Mean Pooling |
+| MoE | ReLU + DTSI | Top-k + Shared Expert | None | None |
+| Origin | ByteDance | ByteDance | Meta | Baseline |
 
 ## Dataset
 
@@ -123,6 +141,19 @@ python train_kuaivideo.py --config config/hstu_middle.yaml
 python train_kuaivideo.py --config config/hstu_large.yaml
 ```
 
+### 5. Train Vanilla Transformer
+
+```bash
+# Small (L=4, H=16, ~61M)
+python train_kuaivideo.py --config config/transformer_small.yaml
+
+# Middle (L=6, H=16, ~108M)
+python train_kuaivideo.py --config config/transformer_middle.yaml
+
+# Large (L=8, H=24, ~259M)
+python train_kuaivideo.py --config config/transformer_large.yaml
+```
+
 ## Model Configurations
 
 ### RankMixer
@@ -148,6 +179,14 @@ python train_kuaivideo.py --config config/hstu_large.yaml
 | `hstu_middle.yaml` | 16 | 512 | 8 | 16 | 32 | 58M |
 | `hstu_large.yaml` | 32 | 1024 | 12 | 32 | 32 | 184M |
 
+### Vanilla Transformer
+
+| Config | T | D | L | Heads | Head dim | ~Params |
+|--------|---|---|---|-------|----------|---------|
+| `transformer_small.yaml` | 16 | 768 | 4 | 16 | 48 | 61M |
+| `transformer_middle.yaml` | 16 | 1024 | 6 | 16 | 64 | 108M |
+| `transformer_large.yaml` | 32 | 1536 | 8 | 24 | 64 | 259M |
+
 ## Project Structure
 
 ```
@@ -165,7 +204,10 @@ rankmixer/
 │   ├── tokenmixer_middle.yaml
 │   ├── hstu_small.yaml       # HSTU configs
 │   ├── hstu_middle.yaml
-│   └── hstu_large.yaml
+│   ├── hstu_large.yaml
+│   ├── transformer_small.yaml # Transformer configs
+│   ├── transformer_middle.yaml
+│   └── transformer_large.yaml
 └── KuaiVideo_x1/             # Dataset
 ```
 
