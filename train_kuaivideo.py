@@ -704,14 +704,47 @@ def build_model(cfg) -> nn.Module:
 # 评估
 # ============================================================
 
+def compute_gauc(user_ids, labels, preds):
+    """
+    计算 Group AUC (GAUC): 按 user_id 分组计算 AUC, 再按样本数加权平均。
+    只对同时包含正负样本的用户分组计算。
+    """
+    from collections import defaultdict
+    user_data = defaultdict(lambda: ([], []))
+    for uid, label, pred in zip(user_ids, labels, preds):
+        user_data[uid][0].append(label)
+        user_data[uid][1].append(pred)
+
+    total_auc = 0.0
+    total_count = 0
+    for uid, (u_labels, u_preds) in user_data.items():
+        u_labels = np.array(u_labels)
+        u_preds = np.array(u_preds)
+        # 只有同时包含正负样本才能计算 AUC
+        if len(set(u_labels)) < 2:
+            continue
+        try:
+            auc = roc_auc_score(u_labels, u_preds)
+            n = len(u_labels)
+            total_auc += auc * n
+            total_count += n
+        except ValueError:
+            continue
+
+    if total_count == 0:
+        return 0.0
+    return total_auc / total_count
+
+
 def evaluate(model, dataloader, device):
     """
     评估模型。DDP 模式下每个 rank 各自跑一部分数据，
     通过 all_gather 汇总到 rank 0 计算全局指标。
+    返回 (auc, gauc, logloss)。
     """
     raw_model = model.module if hasattr(model, "module") else model
     raw_model.eval()
-    all_labels, all_preds = [], []
+    all_labels, all_preds, all_uids = [], [], []
     with torch.no_grad():
         for batch in dataloader:
             uids, iids, u_vis, i_vis, seq_items, seq_lens, labels = batch
@@ -723,9 +756,11 @@ def evaluate(model, dataloader, device):
             probs = torch.sigmoid(logits).cpu()
             all_labels.append(labels)
             all_preds.append(probs)
+            all_uids.append(uids)
 
     all_labels = torch.cat(all_labels)
     all_preds = torch.cat(all_preds)
+    all_uids = torch.cat(all_uids)
 
     if is_dist():
         # all-gather across ranks
@@ -743,28 +778,37 @@ def evaluate(model, dataloader, device):
 
         padded_labels = pad_to(all_labels, max_size).to(device)
         padded_preds = pad_to(all_preds, max_size).to(device)
+        padded_uids = pad_to(all_uids.float(), max_size).to(device)
 
         gathered_labels = [torch.zeros_like(padded_labels) for _ in range(world_size)]
         gathered_preds = [torch.zeros_like(padded_preds) for _ in range(world_size)]
+        gathered_uids = [torch.zeros_like(padded_uids) for _ in range(world_size)]
         dist.all_gather(gathered_labels, padded_labels)
         dist.all_gather(gathered_preds, padded_preds)
+        dist.all_gather(gathered_uids, padded_uids)
 
         if is_main_process():
-            final_labels, final_preds = [], []
+            final_labels, final_preds, final_uids = [], [], []
             for i in range(world_size):
                 n = sizes_list[i].item()
                 final_labels.append(gathered_labels[i][:n].cpu())
                 final_preds.append(gathered_preds[i][:n].cpu())
+                final_uids.append(gathered_uids[i][:n].cpu())
             all_labels = torch.cat(final_labels).numpy()
             all_preds = torch.cat(final_preds).numpy()
+            all_uids = torch.cat(final_uids).numpy().astype(int)
         else:
-            return 0.0, 0.0  # 非 rank 0 不需要结果
+            return 0.0, 0.0, 0.0  # 非 rank 0 不需要结果
     else:
         all_labels = all_labels.numpy()
         all_preds = all_preds.numpy()
+        all_uids = all_uids.numpy().astype(int)
 
     all_preds = np.clip(all_preds, 1e-7, 1 - 1e-7)
-    return roc_auc_score(all_labels, all_preds), log_loss(all_labels, all_preds)
+    auc = roc_auc_score(all_labels, all_preds)
+    gauc = compute_gauc(all_uids, all_labels, all_preds)
+    logloss = log_loss(all_labels, all_preds)
+    return auc, gauc, logloss
 
 
 # ============================================================
@@ -877,6 +921,8 @@ def main():
     test_csv = os.path.join(data_dir, cfg["data"]["test_file"])
 
     best_auc = 0.0
+    no_improve_count = 0
+    early_stop_patience = train_cfg.get("early_stop_patience", 5)
     save_path = os.path.join(project_root, log_cfg["save_path"])
     warmup_steps = train_cfg.get("warmup_steps", 0)
 
@@ -1016,13 +1062,16 @@ def main():
             test_dataset, batch_size=train_cfg["batch_size"] * 2,
             collate_fn=collate_fn, num_workers=0,
         )
-        auc, logloss = evaluate(model, test_loader, device)
+        auc, gauc, logloss = evaluate(model, test_loader, device)
 
+        # Early stopping: rank 0 判断是否提升，广播给所有 rank
+        should_stop = False
         if is_main_process():
-            print(f"  Test AUC: {auc:.4f} | Test LogLoss: {logloss:.4f}")
+            print(f"  Test AUC: {auc:.4f} | Test GAUC: {gauc:.4f} | Test LogLoss: {logloss:.4f}")
 
             wandb.log({
                 "eval/auc": auc,
+                "eval/gauc": gauc,
                 "eval/logloss": logloss,
                 "eval/epoch": epoch + 1,
             }, step=global_step)
@@ -1030,19 +1079,33 @@ def main():
             if log_cfg.get("save_best", True):
                 if auc > best_auc:
                     best_auc = auc
+                    no_improve_count = 0
                     raw_model = model.module if hasattr(model, "module") else model
                     torch.save(raw_model.state_dict(), save_path)
                     print(f"  ** 新最佳模型已保存 (AUC={auc:.4f}) → {save_path}")
                     wandb.run.summary["best_auc"] = best_auc
+                    wandb.run.summary["best_gauc"] = gauc
                     wandb.run.summary["best_epoch"] = epoch + 1
+                else:
+                    no_improve_count += 1
+                    print(f"  AUC 未提升 ({no_improve_count}/{early_stop_patience})")
+                    if no_improve_count >= early_stop_patience:
+                        print(f"  ** Early stopping: 连续 {early_stop_patience} 个 epoch 无提升")
+                        should_stop = True
             else:
                 raw_model = model.module if hasattr(model, "module") else model
                 torch.save(raw_model.state_dict(), save_path)
                 print(f"  模型已保存 → {save_path}")
 
-        # 同步 barrier, 确保所有 rank 等 rank 0 保存完再继续
+        # DDP: 广播 early stop 信号
         if is_dist():
+            stop_tensor = torch.tensor([1 if should_stop else 0], dtype=torch.long, device=device)
+            dist.broadcast(stop_tensor, src=0)
+            should_stop = stop_tensor.item() == 1
             dist.barrier()
+        
+        if should_stop:
+            break
 
     if is_main_process():
         print(f"\n{'='*60}")
