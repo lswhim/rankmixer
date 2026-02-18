@@ -80,7 +80,7 @@ def verify():
 
     if all_ok:
         print("\n[done] 数据准备完成，可以开始训练:")
-        print(f"  python train_kuaivideo.py --config config/kuaivideo_small.yaml")
+        print(f"  python train_kuaivideo.py --config config/rankmixer_small.yaml")
 
 
 if __name__ == "__main__":

@@ -775,7 +775,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config", type=str,
-        default=os.path.join(os.path.dirname(__file__), "config", "kuaivideo_small.yaml"),
+        default=os.path.join(os.path.dirname(__file__), "config", "rankmixer_small.yaml"),
         help="配置文件路径"
     )
     args = parser.parse_args()
