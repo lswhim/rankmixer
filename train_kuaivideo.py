@@ -98,6 +98,13 @@ def get_device(cfg_device: str) -> str:
 
 def load_pretrained_embeddings(cfg):
     data_cfg = cfg["data"]
+    use_pretrained = data_cfg.get("use_pretrained_emb", True)
+
+    if not use_pretrained:
+        if is_main_process():
+            print("跳过预训练 embedding 加载 (use_pretrained_emb=false)")
+        return None, None
+
     project_root = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(project_root, data_cfg["data_dir"])
 
@@ -145,6 +152,13 @@ class KuaiVideoIterDataset(IterableDataset):
         self.item_hash_size = cfg["data"]["item_hash_size"]
         self.max_samples = max_samples
         self.max_seq_len = cfg["data"].get("max_seq_len", 20)
+        self.use_pretrained = user_vis_emb is not None
+        if self.use_pretrained:
+            self.user_vis_dim = user_vis_emb.shape[1]
+            self.item_vis_dim = item_vis_emb.shape[1]
+        else:
+            self.user_vis_dim = 0
+            self.item_vis_dim = 0
 
     def __iter__(self):
         rank = get_rank()
@@ -165,8 +179,13 @@ class KuaiVideoIterDataset(IterableDataset):
                 label = float(row[3])
                 uid = min(user_id, self.num_users - 1)
                 iid_hash = item_id % self.item_hash_size
-                user_vis = self.user_vis_emb[uid]
-                item_vis = self.item_vis_emb[iid_hash]
+
+                if self.use_pretrained:
+                    user_vis = self.user_vis_emb[uid]
+                    item_vis = self.item_vis_emb[iid_hash]
+                else:
+                    user_vis = np.zeros(0, dtype=np.float32)
+                    item_vis = np.zeros(0, dtype=np.float32)
 
                 # 解析 pos_items 行为序列 (col 6, "^" 分隔)
                 raw_pos = row[6] if len(row) > 6 else ""
@@ -281,8 +300,9 @@ class BaseCTR(nn.Module):
 
         user_emb_dim = emb_cfg["user_emb_dim"]
         item_emb_dim = emb_cfg["item_emb_dim"]
-        user_vis_dim = data_cfg["user_vis_dim"]
-        item_vis_dim = data_cfg["item_vis_dim"]
+        self.use_pretrained = data_cfg.get("use_pretrained_emb", True)
+        user_vis_dim = data_cfg["user_vis_dim"] if self.use_pretrained else 0
+        item_vis_dim = data_cfg["item_vis_dim"] if self.use_pretrained else 0
         chunk_size = model_cfg["chunk_size"]
         hidden_dim = model_cfg["hidden_dim"]
 
@@ -315,7 +335,11 @@ class BaseCTR(nn.Module):
         seq_mask = torch.arange(seq_items.size(1), device=seq_items.device).unsqueeze(0) < seq_lens.unsqueeze(1)
         seq_enc = self.din_attn(seq_emb_lookup, i_emb, seq_mask)  # [B, item_emb_dim]
 
-        e_input = torch.cat([u_emb, i_emb, user_vis, item_vis, seq_enc], dim=-1)
+        parts = [u_emb, i_emb]
+        if self.use_pretrained:
+            parts.extend([user_vis, item_vis])
+        parts.append(seq_enc)
+        e_input = torch.cat(parts, dim=-1)
 
         B = e_input.size(0)
         if e_input.size(-1) < self.padded_dim:
@@ -559,8 +583,9 @@ class HSTUCTR(nn.Module):
 
         user_emb_dim = emb_cfg["user_emb_dim"]
         item_emb_dim = emb_cfg["item_emb_dim"]
-        user_vis_dim = data_cfg["user_vis_dim"]
-        item_vis_dim = data_cfg["item_vis_dim"]
+        self.use_pretrained = data_cfg.get("use_pretrained_emb", True)
+        user_vis_dim = data_cfg["user_vis_dim"] if self.use_pretrained else 0
+        item_vis_dim = data_cfg["item_vis_dim"] if self.use_pretrained else 0
         hidden_dim = model_cfg["hidden_dim"]
         num_layers = model_cfg["num_layers"]
         num_heads = model_cfg["num_heads"]
@@ -579,11 +604,11 @@ class HSTUCTR(nn.Module):
         num_action_types = 4
         self.action_emb = nn.Embedding(num_action_types, item_emb_dim)
 
-        # 投影层: content token (item_emb + item_vis → hidden_dim)
+        # 投影层: content token (item_emb [+ item_vis] → hidden_dim)
         self.content_proj = nn.Linear(item_emb_dim + item_vis_dim, hidden_dim)
         # 投影层: action token (item_emb_dim → hidden_dim)
         self.action_proj = nn.Linear(item_emb_dim, hidden_dim)
-        # 投影层: user prefix token (user_emb + user_vis → hidden_dim)
+        # 投影层: user prefix token (user_emb [+ user_vis] → hidden_dim)
         self.user_proj = nn.Linear(user_emb_dim + user_vis_dim, hidden_dim)
 
         # 序列最长: 1 (user prefix) + max_seq_len * 2 (content+action) + 1 (target)
@@ -624,24 +649,30 @@ class HSTUCTR(nn.Module):
         # --- 构造各种 token ---
         # 1. User prefix token: [B, hidden_dim]
         u_emb = self.user_emb(user_ids)                            # [B, user_emb_dim]
-        user_token = self.user_proj(torch.cat([u_emb, user_vis], dim=-1))  # [B, D]
+        if self.use_pretrained:
+            user_token = self.user_proj(torch.cat([u_emb, user_vis], dim=-1))
+        else:
+            user_token = self.user_proj(u_emb)
 
-        # 2. Content tokens for history: item_emb + item_vis
+        # 2. Content tokens for history: item_emb [+ item_vis]
         seq_item_emb = self.item_emb(seq_items)                    # [B, S, item_emb_dim]
-        # 历史 item 的 visual embedding: 需要通过 item_vis_emb 查表
-        # 但训练时 item_vis_emb 不在 GPU 上，所以用零代替历史 item 的 vis
-        # (原文也没有要求历史 item 必须有 vis feature)
-        seq_vis_placeholder = torch.zeros(B, S, item_vis.size(-1), device=device)
-        seq_content_input = torch.cat([seq_item_emb, seq_vis_placeholder], dim=-1)  # [B, S, emb+vis]
+        if self.use_pretrained:
+            seq_vis_placeholder = torch.zeros(B, S, item_vis.size(-1), device=device)
+            seq_content_input = torch.cat([seq_item_emb, seq_vis_placeholder], dim=-1)
+        else:
+            seq_content_input = seq_item_emb
         seq_content_tokens = self.content_proj(seq_content_input)  # [B, S, D]
 
         # 3. Action tokens for history (all click = 0)
         action_ids = torch.zeros(B, S, dtype=torch.long, device=device)
         seq_action_tokens = self.action_proj(self.action_emb(action_ids))  # [B, S, D]
 
-        # 4. Target content token: item_emb + item_vis
+        # 4. Target content token: item_emb [+ item_vis]
         i_emb = self.item_emb(item_ids)                            # [B, item_emb_dim]
-        target_token = self.content_proj(torch.cat([i_emb, item_vis], dim=-1))  # [B, D]
+        if self.use_pretrained:
+            target_token = self.content_proj(torch.cat([i_emb, item_vis], dim=-1))
+        else:
+            target_token = self.content_proj(i_emb)
 
         # --- 构造交替序列: [user, Φ_0, a_0, Φ_1, a_1, ..., Φ_target] ---
         # 交织 content 和 action: [B, S*2, D]

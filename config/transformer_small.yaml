@@ -9,6 +9,7 @@
 
 # --- 数据配置 ---
 data:
+  use_pretrained_emb: false
   data_dir: "KuaiVideo_x1"
   train_file: "train.csv"
   test_file: "test.csv"
@@ -29,7 +30,7 @@ embedding:
 # --- Transformer 模型配置 ---
 model:
   arch: "transformer"
-  chunk_size: 20                         # d → T=16
+  chunk_size: 12                         # d → T=16
   hidden_dim: 768                        # D
   num_layers: 4                          # L
   num_heads: 16                          # H (head_dim = 48)

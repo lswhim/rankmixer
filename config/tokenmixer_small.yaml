@@ -8,6 +8,7 @@
 
 # --- 数据配置 ---
 data:
+  use_pretrained_emb: false
   data_dir: "KuaiVideo_x1"
   train_file: "train.csv"
   test_file: "test.csv"
@@ -28,7 +29,7 @@ embedding:
 # --- TokenMixer-Large 模型配置 ---
 model:
   arch: "tokenmixer_large"
-  chunk_size: 20                         # d → T=16, +1 global = 17
+  chunk_size: 12                         # d → T=16, +1 global = 17
   hidden_dim: 544                        # D (544/17=32)
   num_layers: 4                          # L=4 (可用更深层, 因为有 inter-residual)
   ffn_expansion: 4                       # n
