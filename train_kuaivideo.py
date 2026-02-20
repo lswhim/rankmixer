@@ -151,7 +151,7 @@ class KuaiVideoIterDataset(IterableDataset):
         self.num_users = cfg["data"]["num_users"]
         self.item_hash_size = cfg["data"]["item_hash_size"]
         self.max_samples = max_samples
-        self.max_seq_len = cfg["data"].get("max_seq_len", 20)
+        self.max_seq_len = cfg["data"].get("max_seq_len", 100)
         self.use_pretrained = user_vis_emb is not None
         if self.use_pretrained:
             self.user_vis_dim = user_vis_emb.shape[1]
@@ -171,12 +171,14 @@ class KuaiVideoIterDataset(IterableDataset):
             for row_idx, row in enumerate(reader):
                 if self.max_samples and count >= self.max_samples:
                     return
-                # DDP 分片: 每个 rank 只处理 row_idx % world_size == rank 的行
                 if row_idx % world_size != rank:
                     continue
+                # CSV: timestamp, user_id, item_id, is_click, is_like, is_follow, pos_items, neg_items
                 user_id = int(row[1])
                 item_id = int(row[2])
                 label = float(row[3])
+                is_like = float(row[4])
+                is_follow = float(row[5])
                 uid = min(user_id, self.num_users - 1)
                 iid_hash = item_id % self.item_hash_size
 
@@ -193,33 +195,51 @@ class KuaiVideoIterDataset(IterableDataset):
                     pos_ids = [int(x) % self.item_hash_size for x in raw_pos.split("^")]
                 else:
                     pos_ids = []
-                # 截断到 max_seq_len
-                pos_ids = pos_ids[-max_seq:]  # 取最近的
-                seq_len = len(pos_ids)
-                # pad 到 max_seq_len
-                if seq_len < max_seq:
-                    pos_ids = pos_ids + [0] * (max_seq - seq_len)
+                pos_ids = pos_ids[-max_seq:]
+                pos_len = len(pos_ids)
+                if pos_len < max_seq:
+                    pos_ids = pos_ids + [0] * (max_seq - pos_len)
+
+                # 解析 neg_items 行为序列 (col 7, "^" 分隔)
+                raw_neg = row[7] if len(row) > 7 else ""
+                if raw_neg:
+                    neg_ids = [int(x) % self.item_hash_size for x in raw_neg.split("^")]
+                else:
+                    neg_ids = []
+                neg_ids = neg_ids[-max_seq:]
+                neg_len = len(neg_ids)
+                if neg_len < max_seq:
+                    neg_ids = neg_ids + [0] * (max_seq - neg_len)
 
                 yield (
                     uid, iid_hash,
                     torch.tensor(user_vis, dtype=torch.float32),
                     torch.tensor(item_vis, dtype=torch.float32),
                     torch.tensor(pos_ids, dtype=torch.long),
-                    seq_len,
+                    pos_len,
+                    torch.tensor(neg_ids, dtype=torch.long),
+                    neg_len,
+                    is_like, is_follow,
                     label,
                 )
                 count += 1
 
 
 def collate_fn(batch):
-    user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens, labels = zip(*batch)
+    (user_ids, item_ids, user_vis, item_vis,
+     pos_items, pos_lens, neg_items, neg_lens,
+     is_likes, is_follows, labels) = zip(*batch)
     return (
         torch.tensor(user_ids, dtype=torch.long),
         torch.tensor(item_ids, dtype=torch.long),
         torch.stack(user_vis),
         torch.stack(item_vis),
-        torch.stack(seq_items),                     # [B, max_seq_len]
-        torch.tensor(seq_lens, dtype=torch.long),   # [B]
+        torch.stack(pos_items),                      # [B, max_seq_len]
+        torch.tensor(pos_lens, dtype=torch.long),    # [B]
+        torch.stack(neg_items),                      # [B, max_seq_len]
+        torch.tensor(neg_lens, dtype=torch.long),    # [B]
+        torch.tensor(is_likes, dtype=torch.float32).unsqueeze(-1),   # [B, 1]
+        torch.tensor(is_follows, dtype=torch.float32).unsqueeze(-1), # [B, 1]
         torch.tensor(labels, dtype=torch.float32),
     )
 
@@ -309,11 +329,15 @@ class BaseCTR(nn.Module):
         self.user_emb = nn.Embedding(data_cfg["num_users"], user_emb_dim)
         self.item_emb = nn.Embedding(data_cfg["item_hash_size"], item_emb_dim)
 
-        # DIN 序列注意力: 将行为序列编码为一个 item_emb_dim 维向量
-        self.din_attn = DINAttention(item_emb_dim, hidden_dim=64)
+        # DIN 序列注意力: pos_items 和 neg_items 各一个
+        self.pos_din_attn = DINAttention(item_emb_dim, hidden_dim=64)
+        self.neg_din_attn = DINAttention(item_emb_dim, hidden_dim=64)
 
-        # total_dim 现在多了一路 seq_emb (item_emb_dim)
-        total_dim = user_emb_dim + item_emb_dim + user_vis_dim + item_vis_dim + item_emb_dim
+        # total_dim: user_emb + item_emb + user_vis + item_vis
+        #          + pos_seq_enc + neg_seq_enc + is_like(1) + is_follow(1)
+        extra_dim = 2  # is_like + is_follow
+        total_dim = (user_emb_dim + item_emb_dim + user_vis_dim + item_vis_dim
+                     + item_emb_dim + item_emb_dim + extra_dim)
         self.num_tokens = math.ceil(total_dim / chunk_size)
         self.padded_dim = self.num_tokens * chunk_size
         self.chunk_size = chunk_size
@@ -322,23 +346,29 @@ class BaseCTR(nn.Module):
 
         self.proj = nn.Linear(chunk_size, hidden_dim)
 
-    def _tokenize(self, user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens):
+    def _tokenize(self, user_ids, item_ids, user_vis, item_vis,
+                  pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow):
         """
         公共前处理:
-        embedding → DIN序列编码 → concat → pad → chunk → proj → [B, T, D]
+        embedding → DIN序列编码(pos+neg) → concat(含is_like/is_follow) → pad → chunk → proj → [B, T, D]
         """
         u_emb = self.user_emb(user_ids)       # [B, user_emb_dim]
         i_emb = self.item_emb(item_ids)       # [B, item_emb_dim]
 
-        # DIN: 行为序列编码
-        seq_emb_lookup = self.item_emb(seq_items)   # [B, S, item_emb_dim]
-        seq_mask = torch.arange(seq_items.size(1), device=seq_items.device).unsqueeze(0) < seq_lens.unsqueeze(1)
-        seq_enc = self.din_attn(seq_emb_lookup, i_emb, seq_mask)  # [B, item_emb_dim]
+        # DIN: pos 行为序列编码
+        pos_emb_lookup = self.item_emb(pos_items)   # [B, S, E]
+        pos_mask = torch.arange(pos_items.size(1), device=pos_items.device).unsqueeze(0) < pos_lens.unsqueeze(1)
+        pos_enc = self.pos_din_attn(pos_emb_lookup, i_emb, pos_mask)  # [B, E]
+
+        # DIN: neg 行为序列编码
+        neg_emb_lookup = self.item_emb(neg_items)   # [B, S, E]
+        neg_mask = torch.arange(neg_items.size(1), device=neg_items.device).unsqueeze(0) < neg_lens.unsqueeze(1)
+        neg_enc = self.neg_din_attn(neg_emb_lookup, i_emb, neg_mask)  # [B, E]
 
         parts = [u_emb, i_emb]
         if self.use_pretrained:
             parts.extend([user_vis, item_vis])
-        parts.append(seq_enc)
+        parts.extend([pos_enc, neg_enc, is_like, is_follow])
         e_input = torch.cat(parts, dim=-1)
 
         B = e_input.size(0)
@@ -383,8 +413,10 @@ class RankMixerCTR(BaseCTR):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens):
-        x = self._tokenize(user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens)
+    def forward(self, user_ids, item_ids, user_vis, item_vis,
+                pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow):
+        x = self._tokenize(user_ids, item_ids, user_vis, item_vis,
+                           pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow)
 
         for blk in self.dense_blocks:
             x = blk(x)
@@ -463,8 +495,10 @@ class TokenMixerLargeCTR(BaseCTR):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens):
-        tokens = self._tokenize(user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens)
+    def forward(self, user_ids, item_ids, user_vis, item_vis,
+                pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow):
+        tokens = self._tokenize(user_ids, item_ids, user_vis, item_vis,
+                                pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow)
         B = tokens.size(0)
 
         global_t = self.global_token.expand(B, -1, -1)
@@ -544,8 +578,10 @@ class TransformerCTR(BaseCTR):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens):
-        x = self._tokenize(user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens)
+    def forward(self, user_ids, item_ids, user_vis, item_vis,
+                pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow):
+        x = self._tokenize(user_ids, item_ids, user_vis, item_vis,
+                           pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow)
         x = self.encoder(x)
         x = x.mean(dim=1)
         logits = self.output_head(x).squeeze(-1)
@@ -591,7 +627,7 @@ class HSTUCTR(nn.Module):
         num_heads = model_cfg["num_heads"]
         ffn_expansion = model_cfg.get("ffn_expansion", 4)
         dropout = model_cfg.get("dropout", 0.0)
-        max_seq_len = data_cfg.get("max_seq_len", 20)
+        max_seq_len = data_cfg.get("max_seq_len", 100)
 
         self.hidden_dim = hidden_dim
 
@@ -599,8 +635,7 @@ class HSTUCTR(nn.Module):
         self.user_emb = nn.Embedding(data_cfg["num_users"], user_emb_dim)
         self.item_emb = nn.Embedding(data_cfg["item_hash_size"], item_emb_dim)
 
-        # Action embedding: 目前 pos_items 都是 click, 用一个可学习的 action token
-        # 预留多种 action type (click=0, like=1, follow=2, skip=3)
+        # Action embedding: click=0, like=1, follow=2, skip/neg=3
         num_action_types = 4
         self.action_emb = nn.Embedding(num_action_types, item_emb_dim)
 
@@ -608,11 +643,12 @@ class HSTUCTR(nn.Module):
         self.content_proj = nn.Linear(item_emb_dim + item_vis_dim, hidden_dim)
         # 投影层: action token (item_emb_dim → hidden_dim)
         self.action_proj = nn.Linear(item_emb_dim, hidden_dim)
-        # 投影层: user prefix token (user_emb [+ user_vis] → hidden_dim)
-        self.user_proj = nn.Linear(user_emb_dim + user_vis_dim, hidden_dim)
+        # 投影层: user prefix token (user_emb [+ user_vis] + is_like(1) + is_follow(1) → hidden_dim)
+        self.user_proj = nn.Linear(user_emb_dim + user_vis_dim + 2, hidden_dim)
 
-        # 序列最长: 1 (user prefix) + max_seq_len * 2 (content+action) + 1 (target)
-        max_tokens = 1 + max_seq_len * 2 + 1 + 8  # 留余量
+        # 序列最长: 1 (user prefix) + max_seq_len * 2 (pos content+action)
+        #         + max_seq_len * 2 (neg content+action) + 1 (target)
+        max_tokens = 1 + max_seq_len * 4 + 1 + 8  # 留余量
         self.max_seq_len = max_seq_len
 
         print(f"  [HSTU] Hidden (D): {hidden_dim}, Heads: {num_heads}, "
@@ -637,68 +673,88 @@ class HSTUCTR(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, user_ids, item_ids, user_vis, item_vis, seq_items, seq_lens):
+    def forward(self, user_ids, item_ids, user_vis, item_vis,
+                pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow):
         """
         构造 Content-Action 交替序列并通过 HSTU Layers。
+        序列: [user_prefix, pos_Φ_0, pos_a_0, ..., neg_Φ_0, neg_a_0, ..., Φ_target]
         取最后一个 token (target content) 的输出做预测。
         """
         B = user_ids.size(0)
         device = user_ids.device
-        S = seq_items.size(1)  # max_seq_len
+        S = pos_items.size(1)  # max_seq_len
 
         # --- 构造各种 token ---
-        # 1. User prefix token: [B, hidden_dim]
+        # 1. User prefix token: user_emb [+ user_vis] + is_like + is_follow → [B, hidden_dim]
         u_emb = self.user_emb(user_ids)                            # [B, user_emb_dim]
+        user_parts = [u_emb]
         if self.use_pretrained:
-            user_token = self.user_proj(torch.cat([u_emb, user_vis], dim=-1))
-        else:
-            user_token = self.user_proj(u_emb)
+            user_parts.append(user_vis)
+        user_parts.extend([is_like, is_follow])
+        user_token = self.user_proj(torch.cat(user_parts, dim=-1))
 
-        # 2. Content tokens for history: item_emb [+ item_vis]
-        seq_item_emb = self.item_emb(seq_items)                    # [B, S, item_emb_dim]
+        # 2. Pos content tokens for history: item_emb [+ item_vis]
+        pos_item_emb = self.item_emb(pos_items)                    # [B, S, item_emb_dim]
         if self.use_pretrained:
-            seq_vis_placeholder = torch.zeros(B, S, item_vis.size(-1), device=device)
-            seq_content_input = torch.cat([seq_item_emb, seq_vis_placeholder], dim=-1)
+            pos_vis_placeholder = torch.zeros(B, S, item_vis.size(-1), device=device)
+            pos_content_input = torch.cat([pos_item_emb, pos_vis_placeholder], dim=-1)
         else:
-            seq_content_input = seq_item_emb
-        seq_content_tokens = self.content_proj(seq_content_input)  # [B, S, D]
+            pos_content_input = pos_item_emb
+        pos_content_tokens = self.content_proj(pos_content_input)  # [B, S, D]
 
-        # 3. Action tokens for history (all click = 0)
-        action_ids = torch.zeros(B, S, dtype=torch.long, device=device)
-        seq_action_tokens = self.action_proj(self.action_emb(action_ids))  # [B, S, D]
+        # 3. Pos action tokens (click = 0)
+        pos_action_ids = torch.zeros(B, S, dtype=torch.long, device=device)
+        pos_action_tokens = self.action_proj(self.action_emb(pos_action_ids))  # [B, S, D]
 
-        # 4. Target content token: item_emb [+ item_vis]
+        # 4. Neg content tokens for history
+        neg_item_emb = self.item_emb(neg_items)                    # [B, S, item_emb_dim]
+        if self.use_pretrained:
+            neg_vis_placeholder = torch.zeros(B, S, item_vis.size(-1), device=device)
+            neg_content_input = torch.cat([neg_item_emb, neg_vis_placeholder], dim=-1)
+        else:
+            neg_content_input = neg_item_emb
+        neg_content_tokens = self.content_proj(neg_content_input)  # [B, S, D]
+
+        # 5. Neg action tokens (neg/skip = 3)
+        neg_action_ids = torch.full((B, S), 3, dtype=torch.long, device=device)
+        neg_action_tokens = self.action_proj(self.action_emb(neg_action_ids))  # [B, S, D]
+
+        # 6. Target content token: item_emb [+ item_vis]
         i_emb = self.item_emb(item_ids)                            # [B, item_emb_dim]
         if self.use_pretrained:
             target_token = self.content_proj(torch.cat([i_emb, item_vis], dim=-1))
         else:
             target_token = self.content_proj(i_emb)
 
-        # --- 构造交替序列: [user, Φ_0, a_0, Φ_1, a_1, ..., Φ_target] ---
-        # 交织 content 和 action: [B, S*2, D]
-        interleaved = torch.stack([seq_content_tokens, seq_action_tokens], dim=2)
-        interleaved = interleaved.view(B, S * 2, self.hidden_dim)  # [B, 2S, D]
+        # --- 构造交替序列 ---
+        # Pos interleaved: [Φ_0, a_0, Φ_1, a_1, ...] → [B, 2S, D]
+        pos_interleaved = torch.stack([pos_content_tokens, pos_action_tokens], dim=2)
+        pos_interleaved = pos_interleaved.view(B, S * 2, self.hidden_dim)
 
-        # 拼接: [user_token(1), interleaved(2S), target_token(1)] = [B, 2S+2, D]
+        # Neg interleaved: [Φ_0, a_0, Φ_1, a_1, ...] → [B, 2S, D]
+        neg_interleaved = torch.stack([neg_content_tokens, neg_action_tokens], dim=2)
+        neg_interleaved = neg_interleaved.view(B, S * 2, self.hidden_dim)
+
+        # 拼接: [user(1), pos(2S), neg(2S), target(1)] = [B, 4S+2, D]
         full_seq = torch.cat([
             user_token.unsqueeze(1),       # [B, 1, D]
-            interleaved,                   # [B, 2S, D]
+            pos_interleaved,               # [B, 2S, D]
+            neg_interleaved,               # [B, 2S, D]
             target_token.unsqueeze(1),     # [B, 1, D]
-        ], dim=1)  # [B, 2S+2, D]
+        ], dim=1)  # [B, 4S+2, D]
 
         # --- 构造 attention mask ---
-        # valid 长度: 1 (user) + seq_len*2 (content+action pairs) + 1 (target)
-        valid_lens = 1 + seq_lens * 2 + 1  # [B]
-        total_len = full_seq.size(1)       # 2S+2
+        # valid 长度: 1 (user) + pos_len*2 + neg_len*2 + 1 (target)
+        valid_lens = 1 + pos_lens * 2 + neg_lens * 2 + 1  # [B]
+        total_len = full_seq.size(1)       # 4S+2
 
         # padding mask: [B, total_len], True = valid
-        pos_indices = torch.arange(total_len, device=device).unsqueeze(0)  # [1, total_len]
-        padding_mask = pos_indices < valid_lens.unsqueeze(1)                # [B, total_len]
+        pos_indices = torch.arange(total_len, device=device).unsqueeze(0)
+        padding_mask = pos_indices < valid_lens.unsqueeze(1)
 
         # attention mask: [B, 1, total_len, total_len]
-        # 每个 token 只能 attend 到 valid (非 padding) 的位置
-        attn_mask = padding_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, total_len]
-        attn_mask = attn_mask.expand(B, 1, total_len, total_len)  # [B, 1, T, T]
+        attn_mask = padding_mask.unsqueeze(1).unsqueeze(2)
+        attn_mask = attn_mask.expand(B, 1, total_len, total_len)
 
         # --- HSTU Layers ---
         x = full_seq
@@ -706,7 +762,6 @@ class HSTUCTR(nn.Module):
             x = layer(x, attn_mask=attn_mask)
 
         # --- 取 target 位置的输出 ---
-        # target 位置 = valid_lens - 1 (最后一个 valid token)
         target_idx = (valid_lens - 1).unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
         target_idx = target_idx.expand(B, 1, self.hidden_dim)     # [B, 1, D]
         target_hidden = x.gather(1, target_idx).squeeze(1)         # [B, D]
@@ -778,11 +833,15 @@ def evaluate(model, dataloader, device):
     all_labels, all_preds, all_uids = [], [], []
     with torch.no_grad():
         for batch in dataloader:
-            uids, iids, u_vis, i_vis, seq_items, seq_lens, labels = batch
+            (uids, iids, u_vis, i_vis,
+             pos_items, pos_lens, neg_items, neg_lens,
+             is_likes, is_follows, labels) = batch
             logits, _ = raw_model(
                 uids.to(device), iids.to(device),
                 u_vis.to(device), i_vis.to(device),
-                seq_items.to(device), seq_lens.to(device),
+                pos_items.to(device), pos_lens.to(device),
+                neg_items.to(device), neg_lens.to(device),
+                is_likes.to(device), is_follows.to(device),
             )
             probs = torch.sigmoid(logits).cpu()
             all_labels.append(labels)
@@ -984,13 +1043,19 @@ def main():
         t0 = time.time()
 
         for batch in train_loader:
-            uids, iids, u_vis, i_vis, seq_items, seq_lens, labels = batch
+            (uids, iids, u_vis, i_vis,
+             pos_items, pos_lens, neg_items, neg_lens,
+             is_likes, is_follows, labels) = batch
             uids = uids.to(device)
             iids = iids.to(device)
             u_vis = u_vis.to(device)
             i_vis = i_vis.to(device)
-            seq_items = seq_items.to(device)
-            seq_lens = seq_lens.to(device)
+            pos_items = pos_items.to(device)
+            pos_lens = pos_lens.to(device)
+            neg_items = neg_items.to(device)
+            neg_lens = neg_lens.to(device)
+            is_likes = is_likes.to(device)
+            is_follows = is_follows.to(device)
             labels = labels.to(device)
 
             if warmup_steps > 0 and global_step < warmup_steps:
@@ -999,7 +1064,11 @@ def main():
                     pg["lr"] = warmup_lr
 
             optimizer.zero_grad()
-            main_logits, aux_output = model(uids, iids, u_vis, i_vis, seq_items, seq_lens)
+            main_logits, aux_output = model(
+                uids, iids, u_vis, i_vis,
+                pos_items, pos_lens, neg_items, neg_lens,
+                is_likes, is_follows,
+            )
 
             main_loss = criterion(main_logits, labels)
 

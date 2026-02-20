@@ -3,13 +3,13 @@
 #
 # 标准 Transformer 对照组 (中等规模):
 # Pre-LN, Multi-Head Self-Attention + FFN (GELU), Mean Pooling
-# chunk_size=20 → T=16, D=1024, L=6, H=16, head_dim=64
-# (total_dim = 64*4 + 64(DIN seq) = 320)
+# chunk_size=25 → T=16, D=1024, L=6, H=16, head_dim=64
+# total_dim = 64*6 + 2 = 386
 # ============================================================
 
 # --- 数据配置 ---
 data:
-  use_pretrained_emb: false
+  use_pretrained_emb: true
   data_dir: "KuaiVideo_x1"
   train_file: "train.csv"
   test_file: "test.csv"
@@ -17,10 +17,10 @@ data:
   item_emb_file: "item_visual_emb_dim64.h5"
   num_users: 10000
   num_items: 3242316
-  item_hash_size: 500000
+  item_hash_size: 3250000
   user_vis_dim: 64
   item_vis_dim: 64
-  max_seq_len: 20
+  max_seq_len: 100
 
 # --- 特征 Embedding 配置 ---
 embedding:
@@ -30,7 +30,7 @@ embedding:
 # --- Transformer 模型配置 ---
 model:
   arch: "transformer"
-  chunk_size: 12                         # d → T=16
+  chunk_size: 25                         # d → T=16
   hidden_dim: 1024                       # D
   num_layers: 6                          # L
   num_heads: 16                          # H (head_dim = 64)
@@ -53,7 +53,7 @@ training:
 # --- 日志与评估配置 ---
 logging:
   log_interval: 200
-  eval_samples: 500000
+  eval_samples: 0
   save_path: "transformer_middle_kuaivideo.pt"
   save_best: true
 

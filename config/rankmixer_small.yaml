@@ -3,14 +3,14 @@
 # 对应论文 arXiv:2507.15551 RankMixer-100M 配置
 #
 # 论文配置: T=16, D=768, L=2, k=4, 全 Dense (无 MoE)
-# chunk_size=12 → T = 192/12 = 16, D=768, D/T=48
-# (total_dim = 64+64+64(DIN seq) = 192, 不含预训练 vis emb)
+# chunk_size=25 → T = ceil(386/25) = 16, D=768, D/T=48
+# total_dim = 64*6 + 2 = 386 (含预训练 vis emb + is_like + is_follow + neg_seq)
 # 理论参数量: 2*k*L*T*D² = 2*4*2*16*768² ≈ 150M
 # ============================================================
 
 # --- 数据配置 ---
 data:
-  use_pretrained_emb: false
+  use_pretrained_emb: true
   data_dir: "KuaiVideo_x1"
   train_file: "train.csv"
   test_file: "test.csv"
@@ -18,10 +18,10 @@ data:
   item_emb_file: "item_visual_emb_dim64.h5"
   num_users: 10000
   num_items: 3242316
-  item_hash_size: 500000
+  item_hash_size: 3250000
   user_vis_dim: 64
   item_vis_dim: 64
-  max_seq_len: 20
+  max_seq_len: 100
 
 # --- 特征 Embedding 配置 ---
 embedding:
@@ -32,7 +32,7 @@ embedding:
 # 论文 RankMixer-100M: 全 Dense 架构, L=2
 model:
   arch: "rankmixer"
-  chunk_size: 12                         # d → T=16
+  chunk_size: 25                         # d → T=16
   hidden_dim: 768                        # D
   num_dense_layers: 2                    # L=2 (全 Dense)
   num_moe_layers: 0                      # 无 MoE
@@ -56,7 +56,7 @@ training:
 # --- 日志与评估配置 ---
 logging:
   log_interval: 200
-  eval_samples: 500000
+  eval_samples: 0
   save_path: "rankmixer_small_kuaivideo.pt"
   save_best: true
 
