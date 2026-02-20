@@ -24,3 +24,13 @@ from .hstu import (
     LearnedRelativeBias,
     HSTU,
 )
+
+from .ctr_models import (
+    DINAttention,
+    BaseCTR,
+    RankMixerCTR,
+    TokenMixerLargeCTR,
+    TransformerCTR,
+    HSTUCTR,
+    build_model,
+)
