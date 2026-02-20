@@ -18,6 +18,7 @@ import sys
 import csv
 import time
 import math
+from datetime import datetime
 import argparse
 import numpy as np
 import h5py
@@ -1013,7 +1014,13 @@ def main():
     best_auc = 0.0
     no_improve_count = 0
     early_stop_patience = train_cfg.get("early_stop_patience", 5)
-    save_path = os.path.join(project_root, log_cfg["save_path"])
+    # 保存路径: ckpt/方法名/时间戳/best.pt
+    config_basename = os.path.splitext(os.path.basename(args.config))[0]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_dir = os.path.join(project_root, "ckpt", config_basename, timestamp)
+    if is_main_process():
+        os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, "best.pt")
     warmup_steps = train_cfg.get("warmup_steps", 0)
 
     # TokenMixer-Large 的辅助损失权重
