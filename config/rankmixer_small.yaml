@@ -3,9 +3,9 @@
 # 对应论文 arXiv:2507.15551 RankMixer-100M 配置
 #
 # 论文配置: T=16, D=768, L=2, k=4, 全 Dense (无 MoE)
-# chunk_size=25 → T = ceil(322/25) = 13, D=768, D/T=59
+# chunk_size=21 → T = ceil(322/21) = 16, D=768, D/T=48
 # total_dim = 64*5 + 2 = 322 (user_emb + item_emb + item_vis + pos_enc + neg_enc + is_like + is_follow)
-# 理论参数量: 2*k*L*T*D² = 2*4*2*13*768² ≈ 122M
+# 理论参数量: 2*k*L*T*D² = 2*4*2*16*768² ≈ 150M
 # ============================================================
 
 # --- 数据配置 (与 FuxiCTR benchmark 对齐: 不使用 user visual emb) ---
@@ -30,7 +30,7 @@ embedding:
 # 论文 RankMixer-100M: 全 Dense 架构, L=2
 model:
   arch: "rankmixer"
-  chunk_size: 25                         # d → T=16
+  chunk_size: 21                         # d → T=16
   hidden_dim: 768                        # D
   num_dense_layers: 2                    # L=2 (全 Dense)
   num_moe_layers: 0                      # 无 MoE

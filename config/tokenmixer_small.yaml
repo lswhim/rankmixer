@@ -4,7 +4,7 @@
 #
 # 基于 RankMixer-100M 同等规模, 使用 TokenMixer-Large 架构
 # T=16+1(global)=17, D=544 (544/17=32), L=4, n=4
-# chunk_size=25 → T = ceil(386/25) = 16, +1 global = 17
+# chunk_size=21 → T = ceil(322/21) = 16, +1 global = 17
 # ============================================================
 
 # --- 数据配置 ---
@@ -28,7 +28,7 @@ embedding:
 # --- TokenMixer-Large 模型配置 ---
 model:
   arch: "tokenmixer_large"
-  chunk_size: 25                         # d → T=16, +1 global = 17
+  chunk_size: 21                         # d → T=16, +1 global = 17
   hidden_dim: 544                        # D (544/17=32)
   num_layers: 4                          # L=4
   ffn_expansion: 4                       # n
