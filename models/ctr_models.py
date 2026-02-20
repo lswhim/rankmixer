@@ -90,7 +90,6 @@ class BaseCTR(nn.Module):
         user_emb_dim = emb_cfg["user_emb_dim"]
         item_emb_dim = emb_cfg["item_emb_dim"]
         self.use_pretrained = data_cfg.get("use_pretrained_emb", True)
-        user_vis_dim = data_cfg["user_vis_dim"] if self.use_pretrained else 0
         item_vis_dim = data_cfg["item_vis_dim"] if self.use_pretrained else 0
         chunk_size = model_cfg["chunk_size"]
         hidden_dim = model_cfg["hidden_dim"]
@@ -102,10 +101,10 @@ class BaseCTR(nn.Module):
         self.pos_din_attn = DINAttention(item_emb_dim, hidden_dim=64)
         self.neg_din_attn = DINAttention(item_emb_dim, hidden_dim=64)
 
-        # total_dim: user_emb + item_emb + user_vis + item_vis
+        # total_dim: user_emb + item_emb + item_vis
         #          + pos_seq_enc + neg_seq_enc + is_like(1) + is_follow(1)
         extra_dim = 2  # is_like + is_follow
-        total_dim = (user_emb_dim + item_emb_dim + user_vis_dim + item_vis_dim
+        total_dim = (user_emb_dim + item_emb_dim + item_vis_dim
                      + item_emb_dim + item_emb_dim + extra_dim)
         self.num_tokens = math.ceil(total_dim / chunk_size)
         self.padded_dim = self.num_tokens * chunk_size
@@ -115,7 +114,7 @@ class BaseCTR(nn.Module):
 
         self.proj = nn.Linear(chunk_size, hidden_dim)
 
-    def _tokenize(self, user_ids, item_ids, user_vis, item_vis,
+    def _tokenize(self, user_ids, item_ids, item_vis,
                   pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow):
         """
         公共前处理:
@@ -136,7 +135,7 @@ class BaseCTR(nn.Module):
 
         parts = [u_emb, i_emb]
         if self.use_pretrained:
-            parts.extend([user_vis, item_vis])
+            parts.append(item_vis)
         parts.extend([pos_enc, neg_enc, is_like, is_follow])
         e_input = torch.cat(parts, dim=-1)
 
@@ -182,9 +181,9 @@ class RankMixerCTR(BaseCTR):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, user_ids, item_ids, user_vis, item_vis,
+    def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow):
-        x = self._tokenize(user_ids, item_ids, user_vis, item_vis,
+        x = self._tokenize(user_ids, item_ids, item_vis,
                            pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow)
 
         for blk in self.dense_blocks:
@@ -264,9 +263,9 @@ class TokenMixerLargeCTR(BaseCTR):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, user_ids, item_ids, user_vis, item_vis,
+    def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow):
-        tokens = self._tokenize(user_ids, item_ids, user_vis, item_vis,
+        tokens = self._tokenize(user_ids, item_ids, item_vis,
                                 pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow)
         B = tokens.size(0)
 
@@ -347,9 +346,9 @@ class TransformerCTR(BaseCTR):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, user_ids, item_ids, user_vis, item_vis,
+    def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow):
-        x = self._tokenize(user_ids, item_ids, user_vis, item_vis,
+        x = self._tokenize(user_ids, item_ids, item_vis,
                            pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow)
         x = self.encoder(x)
         x = x.mean(dim=1)
@@ -374,7 +373,7 @@ class HSTUCTR(nn.Module):
       - a_i = 对应行为的 embedding (action token, 这里统一为 click)
       - Φ_target = 当前候选 item (放在末尾)
 
-    用户特征 (user_emb + user_vis) 作为序列的第一个 prefix token。
+    用户特征 (user_emb) 作为序列的第一个 prefix token。
     输出取 Φ_target 位置 (最后一个 token) 的 hidden state。
     """
 
@@ -389,7 +388,6 @@ class HSTUCTR(nn.Module):
         user_emb_dim = emb_cfg["user_emb_dim"]
         item_emb_dim = emb_cfg["item_emb_dim"]
         self.use_pretrained = data_cfg.get("use_pretrained_emb", True)
-        user_vis_dim = data_cfg["user_vis_dim"] if self.use_pretrained else 0
         item_vis_dim = data_cfg["item_vis_dim"] if self.use_pretrained else 0
         hidden_dim = model_cfg["hidden_dim"]
         num_layers = model_cfg["num_layers"]
@@ -412,8 +410,8 @@ class HSTUCTR(nn.Module):
         self.content_proj = nn.Linear(item_emb_dim + item_vis_dim, hidden_dim)
         # 投影层: action token (item_emb_dim → hidden_dim)
         self.action_proj = nn.Linear(item_emb_dim, hidden_dim)
-        # 投影层: user prefix token (user_emb [+ user_vis] + is_like(1) + is_follow(1) → hidden_dim)
-        self.user_proj = nn.Linear(user_emb_dim + user_vis_dim + 2, hidden_dim)
+        # 投影层: user prefix token (user_emb + is_like(1) + is_follow(1) → hidden_dim)
+        self.user_proj = nn.Linear(user_emb_dim + 2, hidden_dim)
 
         # 序列最长: 1 (user prefix) + max_seq_len * 2 (pos content+action)
         #         + max_seq_len * 2 (neg content+action) + 1 (target)
@@ -442,7 +440,7 @@ class HSTUCTR(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, user_ids, item_ids, user_vis, item_vis,
+    def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow):
         """
         构造 Content-Action 交替序列并通过 HSTU Layers。
@@ -454,11 +452,9 @@ class HSTUCTR(nn.Module):
         S = pos_items.size(1)  # max_seq_len
 
         # --- 构造各种 token ---
-        # 1. User prefix token: user_emb [+ user_vis] + is_like + is_follow → [B, hidden_dim]
+        # 1. User prefix token: user_emb + is_like + is_follow → [B, hidden_dim]
         u_emb = self.user_emb(user_ids)                            # [B, user_emb_dim]
         user_parts = [u_emb]
-        if self.use_pretrained:
-            user_parts.append(user_vis)
         user_parts.extend([is_like, is_follow])
         user_token = self.user_proj(torch.cat(user_parts, dim=-1))
 

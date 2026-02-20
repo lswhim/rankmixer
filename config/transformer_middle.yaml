@@ -13,12 +13,10 @@ data:
   data_dir: "KuaiVideo_x1"
   train_file: "train.csv"
   test_file: "test.csv"
-  user_emb_file: "user_visual_emb_dim64.h5"
   item_emb_file: "item_visual_emb_dim64.h5"
   num_users: 10000
   num_items: 3242316
   item_hash_size: 3250000
-  user_vis_dim: 64
   item_vis_dim: 64
   max_seq_len: 100
 

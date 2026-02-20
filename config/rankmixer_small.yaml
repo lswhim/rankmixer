@@ -3,23 +3,21 @@
 # 对应论文 arXiv:2507.15551 RankMixer-100M 配置
 #
 # 论文配置: T=16, D=768, L=2, k=4, 全 Dense (无 MoE)
-# chunk_size=25 → T = ceil(386/25) = 16, D=768, D/T=48
-# total_dim = 64*6 + 2 = 386 (含预训练 vis emb + is_like + is_follow + neg_seq)
-# 理论参数量: 2*k*L*T*D² = 2*4*2*16*768² ≈ 150M
+# chunk_size=25 → T = ceil(322/25) = 13, D=768, D/T=59
+# total_dim = 64*5 + 2 = 322 (user_emb + item_emb + item_vis + pos_enc + neg_enc + is_like + is_follow)
+# 理论参数量: 2*k*L*T*D² = 2*4*2*13*768² ≈ 122M
 # ============================================================
 
-# --- 数据配置 ---
+# --- 数据配置 (与 FuxiCTR benchmark 对齐: 不使用 user visual emb) ---
 data:
   use_pretrained_emb: true
   data_dir: "KuaiVideo_x1"
   train_file: "train.csv"
   test_file: "test.csv"
-  user_emb_file: "user_visual_emb_dim64.h5"
   item_emb_file: "item_visual_emb_dim64.h5"
   num_users: 10000
   num_items: 3242316
   item_hash_size: 3250000
-  user_vis_dim: 64
   item_vis_dim: 64
   max_seq_len: 100
 
@@ -40,18 +38,19 @@ model:
   num_experts: 8                         # (不生效)
   l1_lambda: 0.01                        # (不生效)
 
-# --- 训练配置 ---
+# --- 训练配置 (与 FuxiCTR benchmark 对齐) ---
 training:
-  batch_size: 2048
-  learning_rate: 5.0e-4
-  weight_decay: 1.0e-5
+  batch_size: 8192
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
   num_epochs: 100
-  grad_clip_norm: 1.0
+  grad_clip_norm: 10.0
   optimizer: "adam"
-  scheduler: "cosine"
+  scheduler: "reduce_lr_on_plateau"
+  reduce_lr_on_plateau: true
+  lr_decay_factor: 0.1
   scheduler_eta_min: 1.0e-6
-  warmup_steps: 500
-  early_stop_patience: 5
+  early_stop_patience: 2
 
 # --- 日志与评估配置 ---
 logging:

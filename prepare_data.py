@@ -59,7 +59,7 @@ def extract():
 
 
 def verify():
-    expected = ["train.csv", "test.csv", "item_visual_emb_dim64.h5", "user_visual_emb_dim64.h5"]
+    expected = ["train.csv", "test.csv", "item_visual_emb_dim64.h5"]
     # 解压后的数据目录
     data_dir = os.path.join(SAVE_DIR, "KuaiVideo_x1")
 

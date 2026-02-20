@@ -18,6 +18,7 @@ import sys
 import csv
 import time
 import math
+import random
 from datetime import datetime
 import argparse
 import numpy as np
@@ -98,30 +99,20 @@ def get_device(cfg_device: str) -> str:
 # ============================================================
 
 def load_pretrained_embeddings(cfg):
+    """加载预训练 embedding。与 FuxiCTR benchmark 对齐: 只加载 item visual emb，不用 user visual emb。"""
     data_cfg = cfg["data"]
     use_pretrained = data_cfg.get("use_pretrained_emb", True)
 
     if not use_pretrained:
         if is_main_process():
             print("跳过预训练 embedding 加载 (use_pretrained_emb=false)")
-        return None, None
+        return None
 
     project_root = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(project_root, data_cfg["data_dir"])
 
     if is_main_process():
-        print("加载预训练 embedding ...")
-
-    with h5py.File(os.path.join(data_dir, data_cfg["user_emb_file"]), "r") as f:
-        user_keys = f["key"][:]
-        user_vals = f["value"][:].astype(np.float32)
-
-    num_users = data_cfg["num_users"]
-    user_vis_dim = data_cfg["user_vis_dim"]
-    user_emb_table = np.zeros((num_users, user_vis_dim), dtype=np.float32)
-    for k, v in zip(user_keys, user_vals):
-        if k < num_users:
-            user_emb_table[k] = v
+        print("加载预训练 item visual embedding ...")
 
     with h5py.File(os.path.join(data_dir, data_cfg["item_emb_file"]), "r") as f:
         item_keys = f["key"][:]
@@ -135,9 +126,8 @@ def load_pretrained_embeddings(cfg):
         item_emb_table[hk] = v
 
     if is_main_process():
-        print(f"  User visual emb: {user_emb_table.shape}")
         print(f"  Item visual emb: {item_emb_table.shape}")
-    return user_emb_table, item_emb_table
+    return item_emb_table
 
 
 # ============================================================
@@ -145,95 +135,117 @@ def load_pretrained_embeddings(cfg):
 # ============================================================
 
 class KuaiVideoIterDataset(IterableDataset):
-    def __init__(self, csv_path, user_vis_emb, item_vis_emb, cfg, max_samples=None):
+    def __init__(self, csv_path, item_vis_emb, cfg,
+                 max_samples=None, shuffle_buffer=0):
         self.csv_path = csv_path
-        self.user_vis_emb = user_vis_emb
         self.item_vis_emb = item_vis_emb
         self.num_users = cfg["data"]["num_users"]
         self.item_hash_size = cfg["data"]["item_hash_size"]
         self.max_samples = max_samples
         self.max_seq_len = cfg["data"].get("max_seq_len", 100)
-        self.use_pretrained = user_vis_emb is not None
+        self.shuffle_buffer = shuffle_buffer
+        self.use_pretrained = item_vis_emb is not None
         if self.use_pretrained:
-            self.user_vis_dim = user_vis_emb.shape[1]
             self.item_vis_dim = item_vis_emb.shape[1]
         else:
-            self.user_vis_dim = 0
             self.item_vis_dim = 0
+
+    def _parse_row(self, row, max_seq):
+        """解析 CSV 行为样本 tuple"""
+        user_id = int(row[1])
+        item_id = int(row[2])
+        label = float(row[3])
+        is_like = float(row[4])
+        is_follow = float(row[5])
+        uid = min(user_id, self.num_users - 1)
+        iid_hash = item_id % self.item_hash_size
+
+        if self.use_pretrained:
+            item_vis = self.item_vis_emb[iid_hash]
+        else:
+            item_vis = np.zeros(0, dtype=np.float32)
+
+        raw_pos = row[6] if len(row) > 6 else ""
+        if raw_pos:
+            pos_ids = [int(x) % self.item_hash_size for x in raw_pos.split("^")]
+        else:
+            pos_ids = []
+        pos_ids = pos_ids[-max_seq:]
+        pos_len = len(pos_ids)
+        if pos_len < max_seq:
+            pos_ids = pos_ids + [0] * (max_seq - pos_len)
+
+        raw_neg = row[7] if len(row) > 7 else ""
+        if raw_neg:
+            neg_ids = [int(x) % self.item_hash_size for x in raw_neg.split("^")]
+        else:
+            neg_ids = []
+        neg_ids = neg_ids[-max_seq:]
+        neg_len = len(neg_ids)
+        if neg_len < max_seq:
+            neg_ids = neg_ids + [0] * (max_seq - neg_len)
+
+        return (
+            uid, iid_hash,
+            torch.tensor(item_vis, dtype=torch.float32),
+            torch.tensor(pos_ids, dtype=torch.long),
+            pos_len,
+            torch.tensor(neg_ids, dtype=torch.long),
+            neg_len,
+            is_like, is_follow,
+            label,
+        )
 
     def __iter__(self):
         rank = get_rank()
         world_size = get_world_size()
         count = 0
         max_seq = self.max_seq_len
+        buf = []
+        buf_size = self.shuffle_buffer
+
         with open(self.csv_path, "r") as f:
             reader = csv.reader(f)
             next(reader)
             for row_idx, row in enumerate(reader):
                 if self.max_samples and count >= self.max_samples:
-                    return
+                    break
                 if row_idx % world_size != rank:
                     continue
-                # CSV: timestamp, user_id, item_id, is_click, is_like, is_follow, pos_items, neg_items
-                user_id = int(row[1])
-                item_id = int(row[2])
-                label = float(row[3])
-                is_like = float(row[4])
-                is_follow = float(row[5])
-                uid = min(user_id, self.num_users - 1)
-                iid_hash = item_id % self.item_hash_size
 
-                if self.use_pretrained:
-                    user_vis = self.user_vis_emb[uid]
-                    item_vis = self.item_vis_emb[iid_hash]
+                sample = self._parse_row(row, max_seq)
+
+                if buf_size > 0:
+                    buf.append(sample)
+                    if len(buf) >= buf_size:
+                        random.shuffle(buf)
+                        for s in buf:
+                            yield s
+                            count += 1
+                            if self.max_samples and count >= self.max_samples:
+                                return
+                        buf = []
                 else:
-                    user_vis = np.zeros(0, dtype=np.float32)
-                    item_vis = np.zeros(0, dtype=np.float32)
+                    yield sample
+                    count += 1
 
-                # 解析 pos_items 行为序列 (col 6, "^" 分隔)
-                raw_pos = row[6] if len(row) > 6 else ""
-                if raw_pos:
-                    pos_ids = [int(x) % self.item_hash_size for x in raw_pos.split("^")]
-                else:
-                    pos_ids = []
-                pos_ids = pos_ids[-max_seq:]
-                pos_len = len(pos_ids)
-                if pos_len < max_seq:
-                    pos_ids = pos_ids + [0] * (max_seq - pos_len)
-
-                # 解析 neg_items 行为序列 (col 7, "^" 分隔)
-                raw_neg = row[7] if len(row) > 7 else ""
-                if raw_neg:
-                    neg_ids = [int(x) % self.item_hash_size for x in raw_neg.split("^")]
-                else:
-                    neg_ids = []
-                neg_ids = neg_ids[-max_seq:]
-                neg_len = len(neg_ids)
-                if neg_len < max_seq:
-                    neg_ids = neg_ids + [0] * (max_seq - neg_len)
-
-                yield (
-                    uid, iid_hash,
-                    torch.tensor(user_vis, dtype=torch.float32),
-                    torch.tensor(item_vis, dtype=torch.float32),
-                    torch.tensor(pos_ids, dtype=torch.long),
-                    pos_len,
-                    torch.tensor(neg_ids, dtype=torch.long),
-                    neg_len,
-                    is_like, is_follow,
-                    label,
-                )
+        # flush remaining buffer
+        if buf:
+            random.shuffle(buf)
+            for s in buf:
+                yield s
                 count += 1
+                if self.max_samples and count >= self.max_samples:
+                    return
 
 
 def collate_fn(batch):
-    (user_ids, item_ids, user_vis, item_vis,
+    (user_ids, item_ids, item_vis,
      pos_items, pos_lens, neg_items, neg_lens,
      is_likes, is_follows, labels) = zip(*batch)
     return (
         torch.tensor(user_ids, dtype=torch.long),
         torch.tensor(item_ids, dtype=torch.long),
-        torch.stack(user_vis),
         torch.stack(item_vis),
         torch.stack(pos_items),                      # [B, max_seq_len]
         torch.tensor(pos_lens, dtype=torch.long),    # [B]
@@ -297,12 +309,12 @@ def evaluate(model, dataloader, device):
     all_labels, all_preds, all_uids = [], [], []
     with torch.no_grad():
         for batch in dataloader:
-            (uids, iids, u_vis, i_vis,
+            (uids, iids, i_vis,
              pos_items, pos_lens, neg_items, neg_lens,
              is_likes, is_follows, labels) = batch
             logits, _ = raw_model(
                 uids.to(device), iids.to(device),
-                u_vis.to(device), i_vis.to(device),
+                i_vis.to(device),
                 pos_items.to(device), pos_lens.to(device),
                 neg_items.to(device), neg_lens.to(device),
                 is_likes.to(device), is_follows.to(device),
@@ -433,7 +445,7 @@ def main():
         for k, v in train_cfg.items():
             print(f"  {k}: {v}")
 
-    user_vis_emb, item_vis_emb = load_pretrained_embeddings(cfg)
+    item_vis_emb = load_pretrained_embeddings(cfg)
 
     if is_main_process():
         print("\n构建模型 ...")
@@ -460,15 +472,23 @@ def main():
     if is_dist():
         model = DDP(model, device_ids=[int(os.environ.get("LOCAL_RANK", 0))])
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=train_cfg["learning_rate"],
-        weight_decay=train_cfg["weight_decay"]
-    )
+    # --- 优化器 (与 FuxiCTR benchmark 对齐: Adam, 无 weight_decay) ---
+    opt_name = train_cfg.get("optimizer", "adam").lower()
+    weight_decay = train_cfg.get("weight_decay", 0.0)
+    if opt_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=train_cfg["learning_rate"],
+            weight_decay=weight_decay,
+        )
+    else:
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=train_cfg["learning_rate"],
+            weight_decay=weight_decay,
+        )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=train_cfg["num_epochs"],
-        eta_min=train_cfg["scheduler_eta_min"]
-    )
+    # --- 学习率调度 ---
+    lr_decay_factor = train_cfg.get("lr_decay_factor", 0.1)
+    lr_min = train_cfg.get("scheduler_eta_min", 1e-6)
     criterion = nn.BCEWithLogitsLoss()
 
     train_csv = os.path.join(data_dir, cfg["data"]["train_file"])
@@ -484,7 +504,6 @@ def main():
     if is_main_process():
         os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, "best.pt")
-    warmup_steps = train_cfg.get("warmup_steps", 0)
 
     # TokenMixer-Large 的辅助损失权重
     aux_loss_weight = model_cfg.get("aux_loss_weight", 0.1) if arch == "tokenmixer_large" else 0.0
@@ -499,7 +518,8 @@ def main():
             print(f"{'='*60}")
 
         train_dataset = KuaiVideoIterDataset(
-            train_csv, user_vis_emb, item_vis_emb, cfg
+            train_csv, item_vis_emb, cfg,
+            shuffle_buffer=train_cfg.get("shuffle_buffer", 50000),
         )
         train_loader = DataLoader(
             train_dataset, batch_size=train_cfg["batch_size"],
@@ -513,12 +533,11 @@ def main():
         t0 = time.time()
 
         for batch in train_loader:
-            (uids, iids, u_vis, i_vis,
+            (uids, iids, i_vis,
              pos_items, pos_lens, neg_items, neg_lens,
              is_likes, is_follows, labels) = batch
             uids = uids.to(device)
             iids = iids.to(device)
-            u_vis = u_vis.to(device)
             i_vis = i_vis.to(device)
             pos_items = pos_items.to(device)
             pos_lens = pos_lens.to(device)
@@ -528,14 +547,9 @@ def main():
             is_follows = is_follows.to(device)
             labels = labels.to(device)
 
-            if warmup_steps > 0 and global_step < warmup_steps:
-                warmup_lr = train_cfg["learning_rate"] * (global_step + 1) / warmup_steps
-                for pg in optimizer.param_groups:
-                    pg["lr"] = warmup_lr
-
             optimizer.zero_grad()
             main_logits, aux_output = model(
-                uids, iids, u_vis, i_vis,
+                uids, iids, i_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
                 is_likes, is_follows,
             )
@@ -619,14 +633,12 @@ def main():
                 "epoch/epoch": epoch + 1,
             }, step=global_step)
 
-        scheduler.step()
-
         # --- 评估 ---
         if is_main_process():
             print("\n  评估中 ...")
         eval_samples = log_cfg["eval_samples"] if log_cfg["eval_samples"] > 0 else None
         test_dataset = KuaiVideoIterDataset(
-            test_csv, user_vis_emb, item_vis_emb, cfg, max_samples=eval_samples
+            test_csv, item_vis_emb, cfg, max_samples=eval_samples
         )
         test_loader = DataLoader(
             test_dataset, batch_size=train_cfg["batch_size"] * 2,
@@ -659,6 +671,11 @@ def main():
                 else:
                     no_improve_count += 1
                     print(f"  AUC 未提升 ({no_improve_count}/{early_stop_patience})")
+                    # reduce_lr_on_plateau: 指标不提升时降低学习率 (与 FuxiCTR 对齐)
+                    if train_cfg.get("reduce_lr_on_plateau", True):
+                        for pg in optimizer.param_groups:
+                            pg["lr"] = max(pg["lr"] * lr_decay_factor, lr_min)
+                        print(f"  Reduce LR on plateau → {optimizer.param_groups[0]['lr']:.2e}")
                     if no_improve_count >= early_stop_patience:
                         print(f"  ** Early stopping: 连续 {early_stop_patience} 个 epoch 无提升")
                         should_stop = True
