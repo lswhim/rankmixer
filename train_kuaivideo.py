@@ -249,7 +249,7 @@ def collate_fn(batch):
 # RankMixer 模型组件 (从 rankmixer.py 导入)
 # ============================================================
 
-from rankmixer import (
+from models.rankmixer import (
     MultiHeadTokenMixing, PerTokenFFN, ReLURouter, PerTokenMoEFFN,
     RankMixerBlock, RankMixerMoEBlock,
 )
@@ -439,7 +439,7 @@ class RankMixerCTR(BaseCTR):
 class TokenMixerLargeCTR(BaseCTR):
     def __init__(self, cfg):
         super().__init__(cfg)
-        from tokenmixer_large import (
+        from models.tokenmixer_large import (
             TokenMixerLargeBlock, TokenMixerLargeMoEBlock, RMSNorm,
         )
 
@@ -612,7 +612,7 @@ class HSTUCTR(nn.Module):
 
     def __init__(self, cfg):
         super().__init__()
-        from hstu import HSTULayer, RMSNorm as HSTURMSNorm
+        from models.hstu import HSTULayer, RMSNorm as HSTURMSNorm
 
         data_cfg = cfg["data"]
         emb_cfg = cfg["embedding"]

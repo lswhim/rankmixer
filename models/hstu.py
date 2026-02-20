@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from typing import List, Tuple, Optional
 import math
 
-from rankmixer import FeatureTokenizer
+from .rankmixer import FeatureTokenizer
 
 
 # ============================================================
