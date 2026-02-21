@@ -151,12 +151,11 @@ class KuaiVideoIterDataset(IterableDataset):
             self.item_vis_dim = 0
 
     def _parse_row(self, row, max_seq):
-        """解析 CSV 行为样本 tuple"""
+        """解析 CSV 行为样本 tuple (与 FuxiCTR benchmark 对齐: 无 is_like/is_follow, 双通道序列)"""
         user_id = int(row[1])
         item_id = int(row[2])
         label = float(row[3])
-        is_like = float(row[4])
-        is_follow = float(row[5])
+        # is_like = row[4], is_follow = row[5] — 与 FuxiCTR 对齐, 不使用
         uid = min(user_id, self.num_users - 1)
         iid_hash = item_id % self.item_hash_size
 
@@ -185,6 +184,14 @@ class KuaiVideoIterDataset(IterableDataset):
         if neg_len < max_seq:
             neg_ids = neg_ids + [0] * (max_seq - neg_len)
 
+        # 序列视觉 embedding (双通道: ID + visual)
+        if self.use_pretrained:
+            pos_vis = self.item_vis_emb[pos_ids]  # [max_seq, vis_dim]
+            neg_vis = self.item_vis_emb[neg_ids]  # [max_seq, vis_dim]
+        else:
+            pos_vis = np.zeros((max_seq, 0), dtype=np.float32)
+            neg_vis = np.zeros((max_seq, 0), dtype=np.float32)
+
         return (
             uid, iid_hash,
             torch.tensor(item_vis, dtype=torch.float32),
@@ -192,7 +199,8 @@ class KuaiVideoIterDataset(IterableDataset):
             pos_len,
             torch.tensor(neg_ids, dtype=torch.long),
             neg_len,
-            is_like, is_follow,
+            torch.tensor(pos_vis, dtype=torch.float32),
+            torch.tensor(neg_vis, dtype=torch.float32),
             label,
         )
 
@@ -242,7 +250,7 @@ class KuaiVideoIterDataset(IterableDataset):
 def collate_fn(batch):
     (user_ids, item_ids, item_vis,
      pos_items, pos_lens, neg_items, neg_lens,
-     is_likes, is_follows, labels) = zip(*batch)
+     pos_vis, neg_vis, labels) = zip(*batch)
     return (
         torch.tensor(user_ids, dtype=torch.long),
         torch.tensor(item_ids, dtype=torch.long),
@@ -251,8 +259,8 @@ def collate_fn(batch):
         torch.tensor(pos_lens, dtype=torch.long),    # [B]
         torch.stack(neg_items),                      # [B, max_seq_len]
         torch.tensor(neg_lens, dtype=torch.long),    # [B]
-        torch.tensor(is_likes, dtype=torch.float32).unsqueeze(-1),   # [B, 1]
-        torch.tensor(is_follows, dtype=torch.float32).unsqueeze(-1), # [B, 1]
+        torch.stack(pos_vis),                        # [B, max_seq_len, vis_dim]
+        torch.stack(neg_vis),                        # [B, max_seq_len, vis_dim]
         torch.tensor(labels, dtype=torch.float32),
     )
 
@@ -311,13 +319,13 @@ def evaluate(model, dataloader, device):
         for batch in dataloader:
             (uids, iids, i_vis,
              pos_items, pos_lens, neg_items, neg_lens,
-             is_likes, is_follows, labels) = batch
+             pos_vis, neg_vis, labels) = batch
             logits, _ = raw_model(
                 uids.to(device), iids.to(device),
                 i_vis.to(device),
                 pos_items.to(device), pos_lens.to(device),
                 neg_items.to(device), neg_lens.to(device),
-                is_likes.to(device), is_follows.to(device),
+                pos_vis.to(device), neg_vis.to(device),
             )
             probs = torch.sigmoid(logits).cpu()
             all_labels.append(labels)
@@ -535,7 +543,7 @@ def main():
         for batch in train_loader:
             (uids, iids, i_vis,
              pos_items, pos_lens, neg_items, neg_lens,
-             is_likes, is_follows, labels) = batch
+             pos_vis, neg_vis, labels) = batch
             uids = uids.to(device)
             iids = iids.to(device)
             i_vis = i_vis.to(device)
@@ -543,15 +551,15 @@ def main():
             pos_lens = pos_lens.to(device)
             neg_items = neg_items.to(device)
             neg_lens = neg_lens.to(device)
-            is_likes = is_likes.to(device)
-            is_follows = is_follows.to(device)
+            pos_vis = pos_vis.to(device)
+            neg_vis = neg_vis.to(device)
             labels = labels.to(device)
 
             optimizer.zero_grad()
             main_logits, aux_output = model(
                 uids, iids, i_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
-                is_likes, is_follows,
+                pos_vis, neg_vis,
             )
 
             main_loss = criterion(main_logits, labels)

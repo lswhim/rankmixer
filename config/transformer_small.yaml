@@ -3,8 +3,8 @@
 #
 # 最简单的标准 Transformer 作为对照组:
 # Pre-LN, Multi-Head Self-Attention + FFN (GELU), Mean Pooling
-# chunk_size=21 → T=16, D=768, L=4, H=16, head_dim=48
-# total_dim = 64*5 + 2 = 322
+# chunk_size=28 → T = ceil(448/28) = 16, D=768, L=4, H=16, head_dim=48
+# total_dim = 64+64+64+128+128 = 448
 # ============================================================
 
 # --- 数据配置 ---
@@ -19,6 +19,7 @@ data:
   item_hash_size: 3250000
   item_vis_dim: 64
   max_seq_len: 100
+  embedding_regularizer: 1.0e-4
 
 # --- 特征 Embedding 配置 ---
 embedding:
@@ -28,7 +29,7 @@ embedding:
 # --- Transformer 模型配置 ---
 model:
   arch: "transformer"
-  chunk_size: 21                         # d → T=16
+  chunk_size: 28                         # d → T = ceil(448/28) = 16
   hidden_dim: 768                        # D
   num_layers: 4                          # L
   num_heads: 16                          # H (head_dim = 48)

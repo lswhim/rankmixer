@@ -3,7 +3,7 @@
 # 论文 arXiv:2602.06563, MoE 版本
 #
 # T=16+1=17, D=544 (544/17=32), L=4, E=8, top_k=2
-# chunk_size=21 → T = ceil(322/21) = 16, +1 global = 17
+# chunk_size=28 → T = ceil(448/28) = 16, +1 global = 17
 # Sparse-Pertoken MoE: shared expert + gate scaling
 # ============================================================
 
@@ -19,6 +19,7 @@ data:
   item_hash_size: 3250000
   item_vis_dim: 64
   max_seq_len: 100
+  embedding_regularizer: 1.0e-4
 
 # --- 特征 Embedding 配置 ---
 embedding:
@@ -28,7 +29,7 @@ embedding:
 # --- TokenMixer-Large 模型配置 ---
 model:
   arch: "tokenmixer_large"
-  chunk_size: 21                         # d → T=16, +1 global = 17
+  chunk_size: 28                         # d → T = ceil(448/28) = 16, +1 global = 17
   hidden_dim: 544                        # D (544/17=32)
   num_layers: 4                          # L=4
   ffn_expansion: 4                       # n

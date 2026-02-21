@@ -20,6 +20,7 @@ data:
   item_hash_size: 3250000
   item_vis_dim: 64
   max_seq_len: 100
+  embedding_regularizer: 1.0e-4
 
 # --- 特征 Embedding 配置 ---
 embedding:

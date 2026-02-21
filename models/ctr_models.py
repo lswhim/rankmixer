@@ -93,19 +93,25 @@ class BaseCTR(nn.Module):
         item_vis_dim = data_cfg["item_vis_dim"] if self.use_pretrained else 0
         chunk_size = model_cfg["chunk_size"]
         hidden_dim = model_cfg["hidden_dim"]
+        self.embedding_regularizer = data_cfg.get("embedding_regularizer", 0.0)
 
         self.user_emb = nn.Embedding(data_cfg["num_users"], user_emb_dim)
         self.item_emb = nn.Embedding(data_cfg["item_hash_size"], item_emb_dim)
 
-        # DIN 序列注意力: pos_items 和 neg_items 各一个
-        self.pos_din_attn = DINAttention(item_emb_dim, hidden_dim=64)
-        self.neg_din_attn = DINAttention(item_emb_dim, hidden_dim=64)
+        # Pretrained embedding 投影层 (与 FuxiCTR 对齐: nn.Linear(64,64,bias=False))
+        if self.use_pretrained:
+            self.vis_proj = nn.Linear(item_vis_dim, item_vis_dim, bias=False)
 
-        # total_dim: user_emb + item_emb + item_vis
-        #          + pos_seq_enc + neg_seq_enc + is_like(1) + is_follow(1)
-        extra_dim = 2  # is_like + is_follow
+        # DIN 序列注意力: 双通道 (item_id_emb + item_vis_emb) → DIN
+        # 序列 embedding 维度 = item_emb_dim + item_vis_dim (与 FuxiCTR 对齐)
+        seq_emb_dim = item_emb_dim + item_vis_dim if self.use_pretrained else item_emb_dim
+        self.pos_din_attn = DINAttention(seq_emb_dim, hidden_dim=64)
+        self.neg_din_attn = DINAttention(seq_emb_dim, hidden_dim=64)
+
+        # total_dim: user_emb + item_emb + item_vis + pos_seq_enc + neg_seq_enc
+        # 无 is_like/is_follow (与 FuxiCTR benchmark 对齐)
         total_dim = (user_emb_dim + item_emb_dim + item_vis_dim
-                     + item_emb_dim + item_emb_dim + extra_dim)
+                     + seq_emb_dim + seq_emb_dim)
         self.num_tokens = math.ceil(total_dim / chunk_size)
         self.padded_dim = self.num_tokens * chunk_size
         self.chunk_size = chunk_size
@@ -114,29 +120,56 @@ class BaseCTR(nn.Module):
 
         self.proj = nn.Linear(chunk_size, hidden_dim)
 
+    def _get_embedding_reg_loss(self):
+        """计算 embedding L2 正则损失 (与 FuxiCTR embedding_regularizer 对齐)"""
+        if self.embedding_regularizer <= 0:
+            return torch.tensor(0.0)
+        reg = self.embedding_regularizer * (
+            self.user_emb.weight.norm(2).pow(2) +
+            self.item_emb.weight.norm(2).pow(2)
+        )
+        return reg
+
     def _tokenize(self, user_ids, item_ids, item_vis,
-                  pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow):
+                  pos_items, pos_lens, neg_items, neg_lens,
+                  pos_items_vis, neg_items_vis):
         """
-        公共前处理:
-        embedding → DIN序列编码(pos+neg) → concat(含is_like/is_follow) → pad → chunk → proj → [B, T, D]
+        公共前处理 (与 FuxiCTR benchmark 对齐):
+        embedding → vis_proj → DIN双通道序列编码(pos+neg) → concat → pad → chunk → proj → [B, T, D]
         """
         u_emb = self.user_emb(user_ids)       # [B, user_emb_dim]
         i_emb = self.item_emb(item_ids)       # [B, item_emb_dim]
 
-        # DIN: pos 行为序列编码
-        pos_emb_lookup = self.item_emb(pos_items)   # [B, S, E]
-        pos_mask = torch.arange(pos_items.size(1), device=pos_items.device).unsqueeze(0) < pos_lens.unsqueeze(1)
-        pos_enc = self.pos_din_attn(pos_emb_lookup, i_emb, pos_mask)  # [B, E]
+        if self.use_pretrained:
+            # 投影 target item visual embedding
+            item_vis_proj = self.vis_proj(item_vis)  # [B, vis_dim]
 
-        # DIN: neg 行为序列编码
-        neg_emb_lookup = self.item_emb(neg_items)   # [B, S, E]
+            # DIN: pos 双通道 (item_id_emb + item_vis_emb)
+            pos_id_emb = self.item_emb(pos_items)           # [B, S, item_emb_dim]
+            pos_vis_proj = self.vis_proj(pos_items_vis)      # [B, S, vis_dim]
+            pos_seq_emb = torch.cat([pos_id_emb, pos_vis_proj], dim=-1)  # [B, S, seq_emb_dim]
+            target_seq = torch.cat([i_emb, item_vis_proj], dim=-1)       # [B, seq_emb_dim]
+
+            # DIN: neg 双通道
+            neg_id_emb = self.item_emb(neg_items)           # [B, S, item_emb_dim]
+            neg_vis_proj = self.vis_proj(neg_items_vis)      # [B, S, vis_dim]
+            neg_seq_emb = torch.cat([neg_id_emb, neg_vis_proj], dim=-1)  # [B, S, seq_emb_dim]
+        else:
+            item_vis_proj = None
+            pos_seq_emb = self.item_emb(pos_items)
+            neg_seq_emb = self.item_emb(neg_items)
+            target_seq = i_emb
+
+        pos_mask = torch.arange(pos_items.size(1), device=pos_items.device).unsqueeze(0) < pos_lens.unsqueeze(1)
+        pos_enc = self.pos_din_attn(pos_seq_emb, target_seq, pos_mask)  # [B, seq_emb_dim]
+
         neg_mask = torch.arange(neg_items.size(1), device=neg_items.device).unsqueeze(0) < neg_lens.unsqueeze(1)
-        neg_enc = self.neg_din_attn(neg_emb_lookup, i_emb, neg_mask)  # [B, E]
+        neg_enc = self.neg_din_attn(neg_seq_emb, target_seq, neg_mask)  # [B, seq_emb_dim]
 
         parts = [u_emb, i_emb]
         if self.use_pretrained:
-            parts.append(item_vis)
-        parts.extend([pos_enc, neg_enc, is_like, is_follow])
+            parts.append(item_vis_proj)
+        parts.extend([pos_enc, neg_enc])
         e_input = torch.cat(parts, dim=-1)
 
         B = e_input.size(0)
@@ -182,9 +215,11 @@ class RankMixerCTR(BaseCTR):
         )
 
     def forward(self, user_ids, item_ids, item_vis,
-                pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow):
+                pos_items, pos_lens, neg_items, neg_lens,
+                pos_items_vis, neg_items_vis):
         x = self._tokenize(user_ids, item_ids, item_vis,
-                           pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow)
+                           pos_items, pos_lens, neg_items, neg_lens,
+                           pos_items_vis, neg_items_vis)
 
         for blk in self.dense_blocks:
             x = blk(x)
@@ -193,6 +228,9 @@ class RankMixerCTR(BaseCTR):
         for blk in self.moe_blocks:
             x, reg = blk(x)
             total_reg = total_reg + reg
+
+        # 加上 embedding L2 正则
+        total_reg = total_reg + self._get_embedding_reg_loss().to(x.device)
 
         x = x.mean(dim=1)
         logits = self.output_head(x).squeeze(-1)
@@ -264,9 +302,11 @@ class TokenMixerLargeCTR(BaseCTR):
         )
 
     def forward(self, user_ids, item_ids, item_vis,
-                pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow):
+                pos_items, pos_lens, neg_items, neg_lens,
+                pos_items_vis, neg_items_vis):
         tokens = self._tokenize(user_ids, item_ids, item_vis,
-                                pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow)
+                                pos_items, pos_lens, neg_items, neg_lens,
+                                pos_items_vis, neg_items_vis)
         B = tokens.size(0)
 
         global_t = self.global_token.expand(B, -1, -1)
@@ -347,9 +387,11 @@ class TransformerCTR(BaseCTR):
         )
 
     def forward(self, user_ids, item_ids, item_vis,
-                pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow):
+                pos_items, pos_lens, neg_items, neg_lens,
+                pos_items_vis, neg_items_vis):
         x = self._tokenize(user_ids, item_ids, item_vis,
-                           pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow)
+                           pos_items, pos_lens, neg_items, neg_lens,
+                           pos_items_vis, neg_items_vis)
         x = self.encoder(x)
         x = x.mean(dim=1)
         logits = self.output_head(x).squeeze(-1)
@@ -395,6 +437,7 @@ class HSTUCTR(nn.Module):
         ffn_expansion = model_cfg.get("ffn_expansion", 4)
         dropout = model_cfg.get("dropout", 0.0)
         max_seq_len = data_cfg.get("max_seq_len", 100)
+        self.embedding_regularizer = data_cfg.get("embedding_regularizer", 0.0)
 
         self.hidden_dim = hidden_dim
 
@@ -402,16 +445,20 @@ class HSTUCTR(nn.Module):
         self.user_emb = nn.Embedding(data_cfg["num_users"], user_emb_dim)
         self.item_emb = nn.Embedding(data_cfg["item_hash_size"], item_emb_dim)
 
+        # Pretrained embedding 投影层 (与 FuxiCTR 对齐)
+        if self.use_pretrained:
+            self.vis_proj = nn.Linear(item_vis_dim, item_vis_dim, bias=False)
+
         # Action embedding: click=0, like=1, follow=2, skip/neg=3
         num_action_types = 4
         self.action_emb = nn.Embedding(num_action_types, item_emb_dim)
 
-        # 投影层: content token (item_emb [+ item_vis] → hidden_dim)
+        # 投影层: content token (item_emb + item_vis → hidden_dim)
         self.content_proj = nn.Linear(item_emb_dim + item_vis_dim, hidden_dim)
         # 投影层: action token (item_emb_dim → hidden_dim)
         self.action_proj = nn.Linear(item_emb_dim, hidden_dim)
-        # 投影层: user prefix token (user_emb + is_like(1) + is_follow(1) → hidden_dim)
-        self.user_proj = nn.Linear(user_emb_dim + 2, hidden_dim)
+        # 投影层: user prefix token (user_emb → hidden_dim, 无 is_like/is_follow)
+        self.user_proj = nn.Linear(user_emb_dim, hidden_dim)
 
         # 序列最长: 1 (user prefix) + max_seq_len * 2 (pos content+action)
         #         + max_seq_len * 2 (neg content+action) + 1 (target)
@@ -440,8 +487,19 @@ class HSTUCTR(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
+    def _get_embedding_reg_loss(self):
+        """计算 embedding L2 正则损失"""
+        if self.embedding_regularizer <= 0:
+            return torch.tensor(0.0)
+        reg = self.embedding_regularizer * (
+            self.user_emb.weight.norm(2).pow(2) +
+            self.item_emb.weight.norm(2).pow(2)
+        )
+        return reg
+
     def forward(self, user_ids, item_ids, item_vis,
-                pos_items, pos_lens, neg_items, neg_lens, is_like, is_follow):
+                pos_items, pos_lens, neg_items, neg_lens,
+                pos_items_vis, neg_items_vis):
         """
         构造 Content-Action 交替序列并通过 HSTU Layers。
         序列: [user_prefix, pos_Φ_0, pos_a_0, ..., neg_Φ_0, neg_a_0, ..., Φ_target]
@@ -452,17 +510,15 @@ class HSTUCTR(nn.Module):
         S = pos_items.size(1)  # max_seq_len
 
         # --- 构造各种 token ---
-        # 1. User prefix token: user_emb + is_like + is_follow → [B, hidden_dim]
+        # 1. User prefix token: user_emb → [B, hidden_dim]
         u_emb = self.user_emb(user_ids)                            # [B, user_emb_dim]
-        user_parts = [u_emb]
-        user_parts.extend([is_like, is_follow])
-        user_token = self.user_proj(torch.cat(user_parts, dim=-1))
+        user_token = self.user_proj(u_emb)
 
-        # 2. Pos content tokens for history: item_emb [+ item_vis]
+        # 2. Pos content tokens for history: item_emb + item_vis (双通道)
         pos_item_emb = self.item_emb(pos_items)                    # [B, S, item_emb_dim]
         if self.use_pretrained:
-            pos_vis_placeholder = torch.zeros(B, S, item_vis.size(-1), device=device)
-            pos_content_input = torch.cat([pos_item_emb, pos_vis_placeholder], dim=-1)
+            pos_vis_proj = self.vis_proj(pos_items_vis)             # [B, S, vis_dim]
+            pos_content_input = torch.cat([pos_item_emb, pos_vis_proj], dim=-1)
         else:
             pos_content_input = pos_item_emb
         pos_content_tokens = self.content_proj(pos_content_input)  # [B, S, D]
@@ -471,11 +527,11 @@ class HSTUCTR(nn.Module):
         pos_action_ids = torch.zeros(B, S, dtype=torch.long, device=device)
         pos_action_tokens = self.action_proj(self.action_emb(pos_action_ids))  # [B, S, D]
 
-        # 4. Neg content tokens for history
+        # 4. Neg content tokens for history (双通道)
         neg_item_emb = self.item_emb(neg_items)                    # [B, S, item_emb_dim]
         if self.use_pretrained:
-            neg_vis_placeholder = torch.zeros(B, S, item_vis.size(-1), device=device)
-            neg_content_input = torch.cat([neg_item_emb, neg_vis_placeholder], dim=-1)
+            neg_vis_proj = self.vis_proj(neg_items_vis)             # [B, S, vis_dim]
+            neg_content_input = torch.cat([neg_item_emb, neg_vis_proj], dim=-1)
         else:
             neg_content_input = neg_item_emb
         neg_content_tokens = self.content_proj(neg_content_input)  # [B, S, D]
@@ -484,10 +540,11 @@ class HSTUCTR(nn.Module):
         neg_action_ids = torch.full((B, S), 3, dtype=torch.long, device=device)
         neg_action_tokens = self.action_proj(self.action_emb(neg_action_ids))  # [B, S, D]
 
-        # 6. Target content token: item_emb [+ item_vis]
+        # 6. Target content token: item_emb + item_vis (双通道)
         i_emb = self.item_emb(item_ids)                            # [B, item_emb_dim]
         if self.use_pretrained:
-            target_token = self.content_proj(torch.cat([i_emb, item_vis], dim=-1))
+            target_vis = self.vis_proj(item_vis)                   # [B, vis_dim]
+            target_token = self.content_proj(torch.cat([i_emb, target_vis], dim=-1))
         else:
             target_token = self.content_proj(i_emb)
 
@@ -532,7 +589,8 @@ class HSTUCTR(nn.Module):
         target_hidden = x.gather(1, target_idx).squeeze(1)         # [B, D]
 
         logits = self.output_head(target_hidden).squeeze(-1)
-        return logits, torch.tensor(0.0, device=logits.device)
+        reg_loss = self._get_embedding_reg_loss().to(logits.device)
+        return logits, reg_loss
 
 
 # ============================================================
