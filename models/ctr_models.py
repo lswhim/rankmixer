@@ -395,7 +395,8 @@ class TransformerCTR(BaseCTR):
         x = self.encoder(x)
         x = x.mean(dim=1)
         logits = self.output_head(x).squeeze(-1)
-        return logits, torch.tensor(0.0, device=logits.device)
+        reg_loss = self._get_embedding_reg_loss().to(logits.device)
+        return logits, reg_loss
 
 
 # ============================================================

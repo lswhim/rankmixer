@@ -566,18 +566,22 @@ def main():
             main_loss = criterion(main_logits, labels)
 
             if arch == "tokenmixer_large":
+                # TokenMixer-Large: aux_output 是辅助预测头的 logits
                 if aux_output.abs().sum() > 0:
                     aux_loss = criterion(aux_output, labels)
                     loss = main_loss + aux_loss_weight * aux_loss
                 else:
                     loss = main_loss
                     aux_loss = torch.tensor(0.0)
-            elif arch == "rankmixer":
+                # TokenMixer-Large 也需要 embedding L2 正则 (与 FuxiCTR 对齐)
+                raw = model.module if hasattr(model, "module") else model
+                loss = loss + raw._get_embedding_reg_loss().to(device)
+            else:
+                # rankmixer: aux_output = MoE L1 reg + embedding L2 reg
+                # hstu: aux_output = embedding L2 reg
+                # transformer: aux_output = embedding L2 reg
                 loss = main_loss + aux_output
                 aux_loss = aux_output
-            else:
-                loss = main_loss
-                aux_loss = torch.tensor(0.0)
 
             loss.backward()
 
