@@ -121,10 +121,10 @@ class BaseCTR(nn.Module):
         self.proj = nn.Linear(chunk_size, hidden_dim)
 
     def _get_embedding_reg_loss(self):
-        """计算 embedding L2 正则损失 (与 FuxiCTR embedding_regularizer 对齐)"""
+        """计算 embedding L2 正则损失 (与 FuxiCTR 对齐: λ/p * ||W||_p^p, p=2)"""
         if self.embedding_regularizer <= 0:
             return torch.tensor(0.0)
-        reg = self.embedding_regularizer * (
+        reg = self.embedding_regularizer / 2.0 * (
             self.user_emb.weight.norm(2).pow(2) +
             self.item_emb.weight.norm(2).pow(2)
         )
@@ -488,10 +488,10 @@ class HSTUCTR(nn.Module):
         )
 
     def _get_embedding_reg_loss(self):
-        """计算 embedding L2 正则损失"""
+        """计算 embedding L2 正则损失 (与 FuxiCTR 对齐: λ/p * ||W||_p^p, p=2)"""
         if self.embedding_regularizer <= 0:
             return torch.tensor(0.0)
-        reg = self.embedding_regularizer * (
+        reg = self.embedding_regularizer / 2.0 * (
             self.user_emb.weight.norm(2).pow(2) +
             self.item_emb.weight.norm(2).pow(2)
         )

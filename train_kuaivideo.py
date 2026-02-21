@@ -503,6 +503,7 @@ def main():
     test_csv = os.path.join(data_dir, cfg["data"]["test_file"])
 
     best_auc = 0.0
+    best_monitor = -1.0  # monitor = gAUC + AUC (与 FuxiCTR 对齐)
     no_improve_count = 0
     early_stop_patience = train_cfg.get("early_stop_patience", 5)
     # 保存路径: ckpt/方法名/时间戳/best.pt
@@ -667,18 +668,23 @@ def main():
             }, step=global_step)
 
             if log_cfg.get("save_best", True):
-                if auc > best_auc:
+                # Monitor = gAUC + AUC (与 FuxiCTR monitor: {"gAUC": 1, "AUC": 1} 对齐)
+                current_monitor = gauc + auc
+                if current_monitor > best_monitor:
+                    best_monitor = current_monitor
                     best_auc = auc
                     no_improve_count = 0
                     raw_model = model.module if hasattr(model, "module") else model
                     torch.save(raw_model.state_dict(), save_path)
-                    print(f"  ** 新最佳模型已保存 (AUC={auc:.4f}) → {save_path}")
-                    wandb.run.summary["best_auc"] = best_auc
+                    print(f"  ** 新最佳模型已保存 (AUC={auc:.4f}, gAUC={gauc:.4f}, monitor={current_monitor:.4f}) → {save_path}")
+                    wandb.run.summary["best_auc"] = auc
                     wandb.run.summary["best_gauc"] = gauc
+                    wandb.run.summary["best_monitor"] = current_monitor
                     wandb.run.summary["best_epoch"] = epoch + 1
                 else:
                     no_improve_count += 1
-                    print(f"  AUC 未提升 ({no_improve_count}/{early_stop_patience})")
+                    print(f"  Monitor 未提升 ({no_improve_count}/{early_stop_patience}), "
+                          f"current={current_monitor:.4f}, best={best_monitor:.4f}")
                     # reduce_lr_on_plateau: 指标不提升时降低学习率 (与 FuxiCTR 对齐)
                     if train_cfg.get("reduce_lr_on_plateau", True):
                         for pg in optimizer.param_groups:
