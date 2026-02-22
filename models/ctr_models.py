@@ -16,6 +16,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as ckpt_fn
 
 from .rankmixer import (
     MultiHeadTokenMixing, PerTokenFFN, ReLURouter, PerTokenMoEFFN,
@@ -196,6 +197,7 @@ class RankMixerCTR(BaseCTR):
         model_cfg = cfg["model"]
         T = self.num_tokens
         hidden_dim = self.hidden_dim
+        self._gradient_checkpointing = False
 
         num_dense = model_cfg["num_dense_layers"]
         num_moe = model_cfg["num_moe_layers"]
@@ -229,6 +231,9 @@ class RankMixerCTR(BaseCTR):
         head_layers.append(nn.Linear(in_dim, 1))
         self.output_head = nn.Sequential(*head_layers)
 
+    def enable_gradient_checkpointing(self):
+        self._gradient_checkpointing = True
+
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
                 pos_items_vis, neg_items_vis):
@@ -237,11 +242,17 @@ class RankMixerCTR(BaseCTR):
                            pos_items_vis, neg_items_vis)
 
         for blk in self.dense_blocks:
-            x = blk(x)
+            if self._gradient_checkpointing and self.training:
+                x = ckpt_fn(blk, x, use_reentrant=False)
+            else:
+                x = blk(x)
 
         total_reg = torch.tensor(0.0, device=x.device)
         for blk in self.moe_blocks:
-            x, reg = blk(x)
+            if self._gradient_checkpointing and self.training:
+                x, reg = ckpt_fn(blk, x, use_reentrant=False)
+            else:
+                x, reg = blk(x)
             total_reg = total_reg + reg
 
         # P0: batch-level embedding L2 正则
@@ -267,6 +278,7 @@ class TokenMixerLargeCTR(BaseCTR):
         T = self.num_tokens
         hidden_dim = self.hidden_dim
         T_global = T + 1
+        self._gradient_checkpointing = False
 
         print(f"  [TokenMixer-Large] Feature dim: {self.total_dim}, Tokens (T): {T}, "
               f"+1 global = {T_global}")
@@ -322,6 +334,9 @@ class TokenMixerLargeCTR(BaseCTR):
         head_layers.append(nn.Linear(in_dim, 1))
         self.output_head = nn.Sequential(*head_layers)
 
+    def enable_gradient_checkpointing(self):
+        self._gradient_checkpointing = True
+
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
                 pos_items_vis, neg_items_vis):
@@ -337,7 +352,10 @@ class TokenMixerLargeCTR(BaseCTR):
         residual_cache = x
 
         for i, block in enumerate(self.blocks):
-            x = block(x)
+            if self._gradient_checkpointing and self.training:
+                x = ckpt_fn(block, x, use_reentrant=False)
+            else:
+                x = block(x)
 
             if (i + 1) % self.inter_residual_interval == 0 and i < self.num_layers - 1:
                 x = x + residual_cache
@@ -380,6 +398,7 @@ class TransformerCTR(BaseCTR):
         model_cfg = cfg["model"]
         T = self.num_tokens
         hidden_dim = self.hidden_dim
+        self._gradient_checkpointing = False
 
         num_layers = model_cfg["num_layers"]
         num_heads = model_cfg["num_heads"]
@@ -395,19 +414,18 @@ class TransformerCTR(BaseCTR):
         print(f"  Layers: {num_layers}, FFN expansion: {ffn_expansion}, "
               f"Dropout: {dropout}")
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * ffn_expansion,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,  # Pre-LN
-        )
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_layers,
-            enable_nested_tensor=False,
-        )
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=num_heads,
+                dim_feedforward=hidden_dim * ffn_expansion,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,  # Pre-LN
+            )
+            for _ in range(num_layers)
+        ])
 
         # P3: MLP 预测头
         head_layers = [nn.LayerNorm(hidden_dim)]
@@ -419,13 +437,20 @@ class TransformerCTR(BaseCTR):
         head_layers.append(nn.Linear(in_dim, 1))
         self.output_head = nn.Sequential(*head_layers)
 
+    def enable_gradient_checkpointing(self):
+        self._gradient_checkpointing = True
+
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
                 pos_items_vis, neg_items_vis):
         x, u_emb, i_emb = self._tokenize(user_ids, item_ids, item_vis,
                            pos_items, pos_lens, neg_items, neg_lens,
                            pos_items_vis, neg_items_vis)
-        x = self.encoder(x)
+        for layer in self.layers:
+            if self._gradient_checkpointing and self.training:
+                x = ckpt_fn(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
         x = x.mean(dim=1)
         logits = self.output_head(x).squeeze(-1)
         reg_loss = self._get_embedding_reg_loss(u_emb, i_emb)
@@ -460,6 +485,7 @@ class HSTUCTR(nn.Module):
         data_cfg = cfg["data"]
         emb_cfg = cfg["embedding"]
         model_cfg = cfg["model"]
+        self._gradient_checkpointing = False
 
         user_emb_dim = emb_cfg["user_emb_dim"]
         item_emb_dim = emb_cfg["item_emb_dim"]
@@ -542,6 +568,9 @@ class HSTUCTR(nn.Module):
         )
         return reg
 
+    def enable_gradient_checkpointing(self):
+        self._gradient_checkpointing = True
+
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
                 pos_items_vis, neg_items_vis):
@@ -600,7 +629,10 @@ class HSTUCTR(nn.Module):
         # --- HSTU Layers ---
         x = full_seq
         for layer in self.layers:
-            x = layer(x, attn_mask=attn_mask)
+            if self._gradient_checkpointing and self.training:
+                x = ckpt_fn(layer, x, attn_mask, use_reentrant=False)
+            else:
+                x = layer(x, attn_mask=attn_mask)
 
         # --- 取 target 位置的输出 ---
         target_idx = (valid_lens - 1).unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]

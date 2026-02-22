@@ -52,6 +52,7 @@ training:
   scheduler_eta_min: 1.0e-6
   warmup_steps: 1000
   gradient_accumulation_steps: 8
+  gradient_checkpointing: true
   early_stop_patience: 5
 
 # --- 日志与评估配置 ---

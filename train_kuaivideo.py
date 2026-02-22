@@ -526,6 +526,13 @@ def main():
         print(f"  总参数量: {total_params / 1e6:.2f}M")
         wandb.log({"model/total_params_M": total_params / 1e6}, step=0)
 
+    # 梯度检查点: 用时间换空间, 降低显存占用
+    use_grad_ckpt = train_cfg.get("gradient_checkpointing", False)
+    if use_grad_ckpt and hasattr(model, "enable_gradient_checkpointing"):
+        model.enable_gradient_checkpointing()
+        if is_main_process():
+            print("  Gradient Checkpointing: ON")
+
     # RankMixer 理论参数量
     if arch == "rankmixer" and is_main_process():
         T = model.num_tokens
