@@ -97,6 +97,29 @@ Input Features → Chunking (d) → T Tokens → Proj(D)
 | Train | ~10.93M | user_id, item_id, is_click, user/item visual embeddings (64d) |
 | Test  | ~2.73M  | same |
 
+## Results on KuaiVideo_x1
+
+### Our Results
+
+| Model | AUC | gAUC | LogLoss |
+|-------|-----|------|---------|
+| TokenMixer-Small | 0.7483 | 0.6677 | 0.4293 |
+| RankMixer-Small | 0.7436 | 0.6634 | — |
+| Transformer-Small | 0.7299 | 0.6399 | 0.4374 |
+
+### BARS Benchmark Reference
+
+Benchmark results from [FuxiCTR/BARS](https://github.com/reczoo/FuxiCTR) on KuaiVideo_x1:
+
+| Model | AUC | gAUC | LogLoss |
+|-------|-----|------|---------|
+| DMIN | 0.7508 | 0.6726 | 0.4264 |
+| DIN | 0.7495 | 0.6696 | 0.4268 |
+| DCNv2 | 0.7461 | 0.6658 | 0.4288 |
+| DeepFM | 0.7440 | 0.6624 | 0.4298 |
+
+> Benchmark source: [reczoo/FuxiCTR](https://github.com/reczoo/FuxiCTR) | Dataset: [reczoo/KuaiVideo_x1](https://huggingface.co/datasets/reczoo/KuaiVideo_x1)
+
 ## Quick Start
 
 ### 1. Prepare Data
