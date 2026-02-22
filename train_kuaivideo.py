@@ -598,6 +598,14 @@ def main():
     # TokenMixer-Large 的辅助损失权重
     aux_loss_weight = model_cfg.get("aux_loss_weight", 0.1) if arch == "tokenmixer_large" else 0.0
 
+    # 梯度累积: micro_batch_size = batch_size / accum_steps
+    accum_steps = train_cfg.get("gradient_accumulation_steps", 1)
+    micro_batch_size = train_cfg["batch_size"] // accum_steps
+    if is_main_process() and accum_steps > 1:
+        print(f"\n梯度累积: {accum_steps} steps, "
+              f"effective batch_size={train_cfg['batch_size']}, "
+              f"micro_batch_size={micro_batch_size}")
+
     global_step = 0
 
     for epoch in range(train_cfg["num_epochs"]):
@@ -607,11 +615,11 @@ def main():
                   f"(lr={optimizer.param_groups[0]['lr']:.2e})")
             print(f"{'='*60}")
 
-        # DataLoader: shuffle=True 全局 shuffle (与 FuxiCTR 对齐)
+        # DataLoader: micro_batch_size per step, accum_steps 次累积 = effective batch_size
         if is_dist():
             train_sampler.set_epoch(epoch)
         train_loader = DataLoader(
-            train_dataset, batch_size=train_cfg["batch_size"],
+            train_dataset, batch_size=micro_batch_size,
             shuffle=(train_sampler is None),  # 非 DDP 时全局 shuffle
             sampler=train_sampler,
             collate_fn=collate, num_workers=4, pin_memory=True,
@@ -620,8 +628,10 @@ def main():
         model.train()
         epoch_loss = 0.0
         epoch_samples = 0
-        step = 0
+        step = 0          # micro-step (每个 batch 算一次)
+        optim_step = 0    # optimizer step (每 accum_steps 个 micro-step 算一次)
         t0 = time.time()
+        optimizer.zero_grad()
 
         for batch in train_loader:
             (uids, iids, i_vis,
@@ -638,74 +648,90 @@ def main():
             neg_vis = neg_vis.to(device)
             labels = labels.to(device)
 
-            optimizer.zero_grad()
-            main_logits, aux_output = model(
-                uids, iids, i_vis,
-                pos_items, pos_lens, neg_items, neg_lens,
-                pos_vis, neg_vis,
-            )
+            # DDP: 非累积最后一步时关闭梯度同步，节省通信开销
+            is_accum_last = ((step + 1) % accum_steps == 0)
+            ctx = model.no_sync() if (is_dist() and not is_accum_last) else \
+                  torch.contextmanager(lambda: (yield))()
 
-            main_loss = criterion(main_logits, labels)
+            with ctx:
+                main_logits, aux_output = model(
+                    uids, iids, i_vis,
+                    pos_items, pos_lens, neg_items, neg_lens,
+                    pos_vis, neg_vis,
+                )
 
-            if arch == "tokenmixer_large":
-                # TokenMixer-Large: aux_output 是辅助预测头的 logits
-                if aux_output.abs().sum() > 0:
-                    aux_loss = criterion(aux_output, labels)
-                    loss = main_loss + aux_loss_weight * aux_loss
+                main_loss = criterion(main_logits, labels)
+
+                if arch == "tokenmixer_large":
+                    if aux_output.abs().sum() > 0:
+                        aux_loss = criterion(aux_output, labels)
+                        loss = main_loss + aux_loss_weight * aux_loss
+                    else:
+                        loss = main_loss
+                        aux_loss = torch.tensor(0.0)
+                    raw = model.module if hasattr(model, "module") else model
+                    loss = loss + raw._get_embedding_reg_loss().to(device)
                 else:
-                    loss = main_loss
-                    aux_loss = torch.tensor(0.0)
-                # TokenMixer-Large 也需要 embedding L2 正则 (与 FuxiCTR 对齐)
-                raw = model.module if hasattr(model, "module") else model
-                loss = loss + raw._get_embedding_reg_loss().to(device)
-            else:
-                # rankmixer: aux_output = MoE L1 reg + embedding L2 reg
-                # hstu/transformer/dmin: aux_output = embedding L2 reg
-                loss = main_loss + aux_output
-                aux_loss = aux_output
+                    loss = main_loss + aux_output
+                    aux_loss = aux_output
 
-            loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=train_cfg["grad_clip_norm"]
-            )
-            optimizer.step()
+                # 梯度累积: loss 除以 accum_steps 保证有效梯度与不累积时一致
+                scaled_loss = loss / accum_steps
+                scaled_loss.backward()
 
             bs = labels.size(0)
             epoch_loss += main_loss.item() * bs
             epoch_samples += bs
             step += 1
-            global_step += 1
 
-            # wandb step-level logging (rank 0 only)
-            aux_val = aux_loss.item() if torch.is_tensor(aux_loss) else aux_loss
-            if is_main_process():
-                wandb.log({
-                    "train/loss": loss.item(),
-                    "train/main_loss": main_loss.item(),
-                    "train/aux_loss": aux_val,
-                    "train/lr": optimizer.param_groups[0]["lr"],
-                    "train/epoch": epoch + 1,
-                }, step=global_step)
-
-            if step % log_cfg["log_interval"] == 0 and is_main_process():
-                avg = epoch_loss / epoch_samples
-                elapsed = time.time() - t0
-                speed = epoch_samples / elapsed
-                aux_name = {"tokenmixer_large": "Aux", "rankmixer": "Reg", "dmin": "Reg"}.get(arch, "Reg")
-                print(
-                    f"  Step {step:5d} | "
-                    f"Samples: {epoch_samples:>8d} | "
-                    f"Loss: {avg:.4f} | "
-                    f"Main: {main_loss.item():.4f} | "
-                    f"{aux_name}: {aux_val:.4f} | "
-                    f"Speed: {speed:.0f} s/s | "
-                    f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+            # 累积够 accum_steps 步后执行 optimizer.step()
+            if is_accum_last:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=train_cfg["grad_clip_norm"]
                 )
-                wandb.log({
-                    "train/avg_loss": avg,
-                    "train/speed_samples_per_sec": speed,
-                }, step=global_step)
+                optimizer.step()
+                optimizer.zero_grad()
+                optim_step += 1
+                global_step += 1
+
+                # wandb step-level logging (rank 0 only)
+                aux_val = aux_loss.item() if torch.is_tensor(aux_loss) else aux_loss
+                if is_main_process():
+                    wandb.log({
+                        "train/loss": loss.item(),
+                        "train/main_loss": main_loss.item(),
+                        "train/aux_loss": aux_val,
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/epoch": epoch + 1,
+                    }, step=global_step)
+
+                if optim_step % log_cfg["log_interval"] == 0 and is_main_process():
+                    avg = epoch_loss / epoch_samples
+                    elapsed = time.time() - t0
+                    speed = epoch_samples / elapsed
+                    aux_name = {"tokenmixer_large": "Aux", "rankmixer": "Reg", "dmin": "Reg"}.get(arch, "Reg")
+                    print(
+                        f"  Step {optim_step:5d} | "
+                        f"Samples: {epoch_samples:>8d} | "
+                        f"Loss: {avg:.4f} | "
+                        f"Main: {main_loss.item():.4f} | "
+                        f"{aux_name}: {aux_val:.4f} | "
+                        f"Speed: {speed:.0f} s/s | "
+                        f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+                    )
+                    wandb.log({
+                        "train/avg_loss": avg,
+                        "train/speed_samples_per_sec": speed,
+                    }, step=global_step)
+
+        # 处理尾部不足 accum_steps 的剩余梯度
+        if step % accum_steps != 0:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=train_cfg["grad_clip_norm"]
+            )
+            optimizer.step()
+            optimizer.zero_grad()
+            global_step += 1
 
         # 同步 epoch_loss 和 epoch_samples (可选, 让 rank 0 拿到全局统计)
         if is_dist():
