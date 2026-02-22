@@ -130,97 +130,184 @@ def load_pretrained_embeddings(cfg):
 
 
 # ============================================================
-# 数据集
+# 数据集 (方案 C: 预处理缓存 + 延迟查表)
 # ============================================================
+
+def _preprocess_csv_to_cache(csv_path, cache_path, num_users, item_hash_size, max_seq_len,
+                              max_samples=None):
+    """
+    将 CSV 解析为紧凑 numpy 数组并存为 .npz 缓存文件。
+    只存整数 ID 和 label，不存 pretrained embedding（在 __getitem__ 时查表）。
+
+    存储布局 (每条样本):
+      uid:      int32
+      iid:      int32
+      label:    float32
+      pos_ids:  int32 × max_seq_len  (右 padding 0)
+      pos_len:  int32
+      neg_ids:  int32 × max_seq_len  (右 padding 0)
+      neg_len:  int32
+    """
+    if is_main_process():
+        print(f"  预处理 CSV → 缓存: {csv_path}")
+
+    uids, iids, labels = [], [], []
+    pos_ids_list, pos_lens = [], []
+    neg_ids_list, neg_lens = [], []
+
+    count = 0
+    with open(csv_path, "r") as f:
+        reader = csv.reader(f)
+        next(reader)  # skip header
+        for row in reader:
+            if max_samples and count >= max_samples:
+                break
+
+            user_id = int(row[1])
+            item_id = int(row[2])
+            label = float(row[3])
+            uid = min(user_id, num_users - 1)
+            iid_hash = item_id % item_hash_size
+
+            raw_pos = row[6] if len(row) > 6 else ""
+            if raw_pos:
+                pids = [int(x) % item_hash_size for x in raw_pos.split("^")]
+            else:
+                pids = []
+            pids = pids[-max_seq_len:]
+            plen = len(pids)
+            if plen < max_seq_len:
+                pids = pids + [0] * (max_seq_len - plen)
+
+            raw_neg = row[7] if len(row) > 7 else ""
+            if raw_neg:
+                nids = [int(x) % item_hash_size for x in raw_neg.split("^")]
+            else:
+                nids = []
+            nids = nids[-max_seq_len:]
+            nlen = len(nids)
+            if nlen < max_seq_len:
+                nids = nids + [0] * (max_seq_len - nlen)
+
+            uids.append(uid)
+            iids.append(iid_hash)
+            labels.append(label)
+            pos_ids_list.append(pids)
+            pos_lens.append(plen)
+            neg_ids_list.append(nids)
+            neg_lens.append(nlen)
+            count += 1
+
+            if count % 1000000 == 0 and is_main_process():
+                print(f"    已解析 {count / 1e6:.0f}M 行 ...")
+
+    uids = np.array(uids, dtype=np.int32)
+    iids = np.array(iids, dtype=np.int32)
+    labels = np.array(labels, dtype=np.float32)
+    pos_ids_arr = np.array(pos_ids_list, dtype=np.int32)   # [N, max_seq_len]
+    pos_lens = np.array(pos_lens, dtype=np.int32)
+    neg_ids_arr = np.array(neg_ids_list, dtype=np.int32)   # [N, max_seq_len]
+    neg_lens = np.array(neg_lens, dtype=np.int32)
+
+    np.savez(
+        cache_path,
+        uids=uids, iids=iids, labels=labels,
+        pos_ids=pos_ids_arr, pos_lens=pos_lens,
+        neg_ids=neg_ids_arr, neg_lens=neg_lens,
+    )
+    if is_main_process():
+        size_mb = os.path.getsize(cache_path + ".npz") / 1024 / 1024
+        print(f"  缓存已保存: {cache_path}.npz ({size_mb:.1f} MB, {count} 条样本)")
+
+    return uids, iids, labels, pos_ids_arr, pos_lens, neg_ids_arr, neg_lens
+
 
 class KuaiVideoMapDataset(torch.utils.data.Dataset):
     """
-    全量加载 CSV 到内存的 Map-style Dataset (与 FuxiCTR 对齐)。
-    FuxiCTR 将完整数据集加载到内存, 每个 epoch 通过 DataLoader shuffle=True 做全局 shuffle。
+    高效 Map-style Dataset (方案 C: 预处理缓存 + 延迟查表)。
+
+    - 首次运行: 解析 CSV → 存为 .npz 缓存 (只存 int32 ID + float32 label)
+    - 后续运行: 直接加载 .npz (~秒级)
+    - __getitem__ 时再通过 item_vis_emb[id] 查 pretrained embedding
+    - Shuffle 行为与 FuxiCTR 完全一致: Map-style + DataLoader shuffle=True
     """
     def __init__(self, csv_path, item_vis_emb, cfg, max_samples=None):
         self.item_vis_emb = item_vis_emb
-        self.num_users = cfg["data"]["num_users"]
-        self.item_hash_size = cfg["data"]["item_hash_size"]
-        self.max_seq_len = cfg["data"].get("max_seq_len", 100)
         self.use_pretrained = item_vis_emb is not None
-        if self.use_pretrained:
-            self.item_vis_dim = item_vis_emb.shape[1]
+        self.item_vis_dim = item_vis_emb.shape[1] if self.use_pretrained else 0
+
+        num_users = cfg["data"]["num_users"]
+        item_hash_size = cfg["data"]["item_hash_size"]
+        max_seq_len = cfg["data"].get("max_seq_len", 100)
+        self.max_seq_len = max_seq_len
+
+        # 确定缓存路径: 与 csv 同目录, 同名 .npz
+        base = os.path.splitext(csv_path)[0]
+        suffix = f"_n{max_samples}" if max_samples else ""
+        cache_path = f"{base}_cache_seq{max_seq_len}{suffix}"
+        cache_file = cache_path + ".npz"
+
+        if os.path.exists(cache_file):
+            if is_main_process():
+                print(f"  加载缓存: {cache_file}")
+            data = np.load(cache_file)
+            self.uids = data["uids"]
+            self.iids = data["iids"]
+            self.labels = data["labels"]
+            self.pos_ids = data["pos_ids"]
+            self.pos_lens = data["pos_lens"]
+            self.neg_ids = data["neg_ids"]
+            self.neg_lens = data["neg_lens"]
+            if max_samples and len(self.uids) > max_samples:
+                self.uids = self.uids[:max_samples]
+                self.iids = self.iids[:max_samples]
+                self.labels = self.labels[:max_samples]
+                self.pos_ids = self.pos_ids[:max_samples]
+                self.pos_lens = self.pos_lens[:max_samples]
+                self.neg_ids = self.neg_ids[:max_samples]
+                self.neg_lens = self.neg_lens[:max_samples]
+            if is_main_process():
+                print(f"  缓存加载完成: {len(self.uids)} 条样本")
         else:
-            self.item_vis_dim = 0
-
-        # 一次性解析全部 CSV 行
-        if is_main_process():
-            print(f"  加载数据到内存: {csv_path}")
-        self.samples = []
-        max_seq = self.max_seq_len
-        with open(csv_path, "r") as f:
-            reader = csv.reader(f)
-            next(reader)  # skip header
-            for row in reader:
-                if max_samples and len(self.samples) >= max_samples:
-                    break
-                self.samples.append(self._parse_row(row, max_seq))
-        if is_main_process():
-            print(f"  加载完成: {len(self.samples)} 条样本")
-
-    def _parse_row(self, row, max_seq):
-        """解析 CSV 行为样本 tuple (与 FuxiCTR benchmark 对齐: 无 is_like/is_follow, 双通道序列)"""
-        user_id = int(row[1])
-        item_id = int(row[2])
-        label = float(row[3])
-        uid = min(user_id, self.num_users - 1)
-        iid_hash = item_id % self.item_hash_size
-
-        if self.use_pretrained:
-            item_vis = self.item_vis_emb[iid_hash]
-        else:
-            item_vis = np.zeros(0, dtype=np.float32)
-
-        raw_pos = row[6] if len(row) > 6 else ""
-        if raw_pos:
-            pos_ids = [int(x) % self.item_hash_size for x in raw_pos.split("^")]
-        else:
-            pos_ids = []
-        pos_ids = pos_ids[-max_seq:]
-        pos_len = len(pos_ids)
-        if pos_len < max_seq:
-            pos_ids = pos_ids + [0] * (max_seq - pos_len)
-
-        raw_neg = row[7] if len(row) > 7 else ""
-        if raw_neg:
-            neg_ids = [int(x) % self.item_hash_size for x in raw_neg.split("^")]
-        else:
-            neg_ids = []
-        neg_ids = neg_ids[-max_seq:]
-        neg_len = len(neg_ids)
-        if neg_len < max_seq:
-            neg_ids = neg_ids + [0] * (max_seq - neg_len)
-
-        if self.use_pretrained:
-            pos_vis = self.item_vis_emb[pos_ids]
-            neg_vis = self.item_vis_emb[neg_ids]
-        else:
-            pos_vis = np.zeros((max_seq, 0), dtype=np.float32)
-            neg_vis = np.zeros((max_seq, 0), dtype=np.float32)
-
-        return (
-            uid, iid_hash,
-            torch.tensor(item_vis, dtype=torch.float32),
-            torch.tensor(pos_ids, dtype=torch.long),
-            pos_len,
-            torch.tensor(neg_ids, dtype=torch.long),
-            neg_len,
-            torch.tensor(pos_vis, dtype=torch.float32),
-            torch.tensor(neg_vis, dtype=torch.float32),
-            label,
-        )
+            (self.uids, self.iids, self.labels,
+             self.pos_ids, self.pos_lens,
+             self.neg_ids, self.neg_lens) = _preprocess_csv_to_cache(
+                csv_path, cache_path, num_users, item_hash_size, max_seq_len,
+                max_samples=max_samples,
+            )
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.uids)
 
     def __getitem__(self, idx):
-        return self.samples[idx]
+        uid = int(self.uids[idx])
+        iid = int(self.iids[idx])
+        label = float(self.labels[idx])
+        pos_ids = self.pos_ids[idx]      # numpy int32 [max_seq_len]
+        pos_len = int(self.pos_lens[idx])
+        neg_ids = self.neg_ids[idx]      # numpy int32 [max_seq_len]
+        neg_len = int(self.neg_lens[idx])
+
+        if self.use_pretrained:
+            item_vis = self.item_vis_emb[iid]                # [vis_dim]
+            pos_vis = self.item_vis_emb[pos_ids]             # [max_seq_len, vis_dim]
+            neg_vis = self.item_vis_emb[neg_ids]             # [max_seq_len, vis_dim]
+        else:
+            item_vis = np.zeros(0, dtype=np.float32)
+            pos_vis = np.zeros((self.max_seq_len, 0), dtype=np.float32)
+            neg_vis = np.zeros((self.max_seq_len, 0), dtype=np.float32)
+
+        return (
+            uid, iid,
+            torch.from_numpy(np.ascontiguousarray(item_vis)),
+            torch.from_numpy(np.ascontiguousarray(pos_ids).astype(np.int64)),
+            pos_len,
+            torch.from_numpy(np.ascontiguousarray(neg_ids).astype(np.int64)),
+            neg_len,
+            torch.from_numpy(np.ascontiguousarray(pos_vis)),
+            torch.from_numpy(np.ascontiguousarray(neg_vis)),
+            label,
+        )
 
 
 def collate_fn(batch):
