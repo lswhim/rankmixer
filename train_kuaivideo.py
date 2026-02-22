@@ -21,6 +21,7 @@ import math
 from datetime import datetime
 import argparse
 import numpy as np
+import pandas as pd
 import h5py
 import yaml
 import torch
@@ -133,81 +134,69 @@ def load_pretrained_embeddings(cfg):
 # 数据集 (方案 C: 预处理缓存 + 延迟查表)
 # ============================================================
 
+def _parse_seq_column(series, item_hash_size, max_seq_len):
+    """
+    向量化解析序列列 (如 pos_items / neg_items)。
+    输入: pandas Series，每个元素是 "id1^id2^id3" 或 NaN
+    输出: ids_arr [N, max_seq_len] int32, lens_arr [N] int32
+    """
+    N = len(series)
+    ids_arr = np.zeros((N, max_seq_len), dtype=np.int32)
+    lens_arr = np.zeros(N, dtype=np.int32)
+
+    for i, val in enumerate(series):
+        if not isinstance(val, str) or val == "":
+            continue
+        parts = val.split("^")
+        seq = [int(x) % item_hash_size for x in parts]
+        seq = seq[-max_seq_len:]
+        slen = len(seq)
+        ids_arr[i, :slen] = seq
+        lens_arr[i] = slen
+
+    return ids_arr, lens_arr
+
+
 def _preprocess_csv_to_cache(csv_path, cache_path, num_users, item_hash_size, max_seq_len,
                               max_samples=None):
     """
-    将 CSV 解析为紧凑 numpy 数组并存为 .npz 缓存文件。
-    只存整数 ID 和 label，不存 pretrained embedding（在 __getitem__ 时查表）。
-
-    存储布局 (每条样本):
-      uid:      int32
-      iid:      int32
-      label:    float32
-      pos_ids:  int32 × max_seq_len  (右 padding 0)
-      pos_len:  int32
-      neg_ids:  int32 × max_seq_len  (右 padding 0)
-      neg_len:  int32
+    用 pandas 批量解析 CSV 并存为 .npz 缓存。
+    比逐行 csv.reader 快 5-10x (pandas C 引擎 + 向量化操作)。
     """
     if is_main_process():
-        print(f"  预处理 CSV → 缓存: {csv_path}")
+        print(f"  预处理 CSV → 缓存 (pandas 加速): {csv_path}")
+        t0 = time.time()
 
-    uids, iids, labels = [], [], []
-    pos_ids_list, pos_lens = [], []
-    neg_ids_list, neg_lens = [], []
+    # pandas C 引擎批量读取，只读需要的列
+    df = pd.read_csv(
+        csv_path,
+        usecols=[1, 2, 3, 6, 7],
+        names=["user_id", "item_id", "is_click", "pos_items", "neg_items"],
+        header=0,
+        dtype={"user_id": np.int64, "item_id": np.int64, "is_click": np.float32,
+               "pos_items": str, "neg_items": str},
+        nrows=max_samples,
+        engine="c",
+        na_filter=False,
+    )
+    if is_main_process():
+        print(f"    CSV 读取完成: {len(df)} 行, 耗时 {time.time() - t0:.1f}s")
 
-    count = 0
-    with open(csv_path, "r") as f:
-        reader = csv.reader(f)
-        next(reader)  # skip header
-        for row in reader:
-            if max_samples and count >= max_samples:
-                break
+    # 向量化处理标量列
+    uids = np.minimum(df["user_id"].values, num_users - 1).astype(np.int32)
+    iids = (df["item_id"].values % item_hash_size).astype(np.int32)
+    labels = df["is_click"].values.astype(np.float32)
 
-            user_id = int(row[1])
-            item_id = int(row[2])
-            label = float(row[3])
-            uid = min(user_id, num_users - 1)
-            iid_hash = item_id % item_hash_size
+    # 解析序列列
+    if is_main_process():
+        print(f"    解析 pos_items 序列 ...")
+    pos_ids_arr, pos_lens = _parse_seq_column(df["pos_items"], item_hash_size, max_seq_len)
 
-            raw_pos = row[6] if len(row) > 6 else ""
-            if raw_pos:
-                pids = [int(x) % item_hash_size for x in raw_pos.split("^")]
-            else:
-                pids = []
-            pids = pids[-max_seq_len:]
-            plen = len(pids)
-            if plen < max_seq_len:
-                pids = pids + [0] * (max_seq_len - plen)
+    if is_main_process():
+        print(f"    解析 neg_items 序列 ...")
+    neg_ids_arr, neg_lens = _parse_seq_column(df["neg_items"], item_hash_size, max_seq_len)
 
-            raw_neg = row[7] if len(row) > 7 else ""
-            if raw_neg:
-                nids = [int(x) % item_hash_size for x in raw_neg.split("^")]
-            else:
-                nids = []
-            nids = nids[-max_seq_len:]
-            nlen = len(nids)
-            if nlen < max_seq_len:
-                nids = nids + [0] * (max_seq_len - nlen)
-
-            uids.append(uid)
-            iids.append(iid_hash)
-            labels.append(label)
-            pos_ids_list.append(pids)
-            pos_lens.append(plen)
-            neg_ids_list.append(nids)
-            neg_lens.append(nlen)
-            count += 1
-
-            if count % 1000000 == 0 and is_main_process():
-                print(f"    已解析 {count / 1e6:.0f}M 行 ...")
-
-    uids = np.array(uids, dtype=np.int32)
-    iids = np.array(iids, dtype=np.int32)
-    labels = np.array(labels, dtype=np.float32)
-    pos_ids_arr = np.array(pos_ids_list, dtype=np.int32)   # [N, max_seq_len]
-    pos_lens = np.array(pos_lens, dtype=np.int32)
-    neg_ids_arr = np.array(neg_ids_list, dtype=np.int32)   # [N, max_seq_len]
-    neg_lens = np.array(neg_lens, dtype=np.int32)
+    del df  # 释放 DataFrame 内存
 
     np.savez(
         cache_path,
@@ -217,24 +206,23 @@ def _preprocess_csv_to_cache(csv_path, cache_path, num_users, item_hash_size, ma
     )
     if is_main_process():
         size_mb = os.path.getsize(cache_path + ".npz") / 1024 / 1024
-        print(f"  缓存已保存: {cache_path}.npz ({size_mb:.1f} MB, {count} 条样本)")
+        elapsed = time.time() - t0
+        print(f"  缓存已保存: {cache_path}.npz ({size_mb:.1f} MB, {len(uids)} 条样本, 总耗时 {elapsed:.1f}s)")
 
     return uids, iids, labels, pos_ids_arr, pos_lens, neg_ids_arr, neg_lens
 
 
 class KuaiVideoMapDataset(torch.utils.data.Dataset):
     """
-    高效 Map-style Dataset (方案 C: 预处理缓存 + 延迟查表)。
+    高效 Map-style Dataset (方案 C: 预处理缓存 + collate 批量查表)。
 
     - 首次运行: 解析 CSV → 存为 .npz 缓存 (只存 int32 ID + float32 label)
     - 后续运行: 直接加载 .npz (~秒级)
-    - __getitem__ 时再通过 item_vis_emb[id] 查 pretrained embedding
+    - __getitem__ 只返回轻量 ID, embedding 查表在 collate_fn 批量完成
     - Shuffle 行为与 FuxiCTR 完全一致: Map-style + DataLoader shuffle=True
     """
     def __init__(self, csv_path, item_vis_emb, cfg, max_samples=None):
-        self.item_vis_emb = item_vis_emb
-        self.use_pretrained = item_vis_emb is not None
-        self.item_vis_dim = item_vis_emb.shape[1] if self.use_pretrained else 0
+        # Dataset 不持有 item_vis_emb (避免 DataLoader worker fork 时复制大数组)
 
         num_users = cfg["data"]["num_users"]
         item_hash_size = cfg["data"]["item_hash_size"]
@@ -280,52 +268,62 @@ class KuaiVideoMapDataset(torch.utils.data.Dataset):
         return len(self.uids)
 
     def __getitem__(self, idx):
-        uid = int(self.uids[idx])
-        iid = int(self.iids[idx])
-        label = float(self.labels[idx])
-        pos_ids = self.pos_ids[idx]      # numpy int32 [max_seq_len]
-        pos_len = int(self.pos_lens[idx])
-        neg_ids = self.neg_ids[idx]      # numpy int32 [max_seq_len]
-        neg_len = int(self.neg_lens[idx])
-
-        if self.use_pretrained:
-            item_vis = self.item_vis_emb[iid]                # [vis_dim]
-            pos_vis = self.item_vis_emb[pos_ids]             # [max_seq_len, vis_dim]
-            neg_vis = self.item_vis_emb[neg_ids]             # [max_seq_len, vis_dim]
-        else:
-            item_vis = np.zeros(0, dtype=np.float32)
-            pos_vis = np.zeros((self.max_seq_len, 0), dtype=np.float32)
-            neg_vis = np.zeros((self.max_seq_len, 0), dtype=np.float32)
-
+        # 只返回轻量 ID，不做 embedding 查表 (查表在 collate_fn 批量完成)
         return (
-            uid, iid,
-            torch.from_numpy(np.ascontiguousarray(item_vis)),
-            torch.from_numpy(np.ascontiguousarray(pos_ids).astype(np.int64)),
-            pos_len,
-            torch.from_numpy(np.ascontiguousarray(neg_ids).astype(np.int64)),
-            neg_len,
-            torch.from_numpy(np.ascontiguousarray(pos_vis)),
-            torch.from_numpy(np.ascontiguousarray(neg_vis)),
-            label,
+            int(self.uids[idx]),
+            int(self.iids[idx]),
+            self.pos_ids[idx],                # numpy int32 [max_seq_len]
+            int(self.pos_lens[idx]),
+            self.neg_ids[idx],                # numpy int32 [max_seq_len]
+            int(self.neg_lens[idx]),
+            float(self.labels[idx]),
         )
 
 
-def collate_fn(batch):
-    (user_ids, item_ids, item_vis,
-     pos_items, pos_lens, neg_items, neg_lens,
-     pos_vis, neg_vis, labels) = zip(*batch)
-    return (
-        torch.tensor(user_ids, dtype=torch.long),
-        torch.tensor(item_ids, dtype=torch.long),
-        torch.stack(item_vis),
-        torch.stack(pos_items),                      # [B, max_seq_len]
-        torch.tensor(pos_lens, dtype=torch.long),    # [B]
-        torch.stack(neg_items),                      # [B, max_seq_len]
-        torch.tensor(neg_lens, dtype=torch.long),    # [B]
-        torch.stack(pos_vis),                        # [B, max_seq_len, vis_dim]
-        torch.stack(neg_vis),                        # [B, max_seq_len, vis_dim]
-        torch.tensor(labels, dtype=torch.float32),
-    )
+def make_collate_fn(item_vis_emb):
+    """
+    创建 collate_fn 闭包，在 collate 阶段批量查 embedding。
+    numpy 高级索引对整个 batch 一次性完成，比逐条 __getitem__ 查表快很多。
+    """
+    use_pretrained = item_vis_emb is not None
+
+    def collate_fn(batch):
+        uids, iids, pos_ids_list, pos_lens, neg_ids_list, neg_lens, labels = zip(*batch)
+
+        uids_t = torch.tensor(uids, dtype=torch.long)
+        iids_t = torch.tensor(iids, dtype=torch.long)
+        pos_lens_t = torch.tensor(pos_lens, dtype=torch.long)
+        neg_lens_t = torch.tensor(neg_lens, dtype=torch.long)
+        labels_t = torch.tensor(labels, dtype=torch.float32)
+
+        # 堆叠 ID 数组: [B, max_seq_len]
+        pos_ids_np = np.stack(pos_ids_list)       # [B, S] int32
+        neg_ids_np = np.stack(neg_ids_list)       # [B, S] int32
+        pos_items_t = torch.from_numpy(pos_ids_np.astype(np.int64))
+        neg_items_t = torch.from_numpy(neg_ids_np.astype(np.int64))
+
+        if use_pretrained:
+            # 批量查表: numpy 高级索引一次性完成
+            iids_np = np.array(iids, dtype=np.int32)
+            item_vis_t = torch.from_numpy(item_vis_emb[iids_np].copy())         # [B, vis_dim]
+            pos_vis_t = torch.from_numpy(item_vis_emb[pos_ids_np].copy())       # [B, S, vis_dim]
+            neg_vis_t = torch.from_numpy(item_vis_emb[neg_ids_np].copy())       # [B, S, vis_dim]
+        else:
+            B = len(uids)
+            item_vis_t = torch.zeros(B, 0, dtype=torch.float32)
+            S = pos_ids_np.shape[1]
+            pos_vis_t = torch.zeros(B, S, 0, dtype=torch.float32)
+            neg_vis_t = torch.zeros(B, S, 0, dtype=torch.float32)
+
+        return (
+            uids_t, iids_t, item_vis_t,
+            pos_items_t, pos_lens_t,
+            neg_items_t, neg_lens_t,
+            pos_vis_t, neg_vis_t,
+            labels_t,
+        )
+
+    return collate_fn
 
 from models.ctr_models import (
     DINAttention, BaseCTR, RankMixerCTR, TokenMixerLargeCTR,
@@ -574,6 +572,9 @@ def main():
     eval_samples = log_cfg["eval_samples"] if log_cfg["eval_samples"] > 0 else None
     test_dataset = KuaiVideoMapDataset(test_csv, item_vis_emb, cfg, max_samples=eval_samples)
 
+    # 创建 collate_fn (embedding 查表在 collate 阶段批量完成)
+    collate = make_collate_fn(item_vis_emb)
+
     # DDP: 使用 DistributedSampler
     if is_dist():
         train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -613,7 +614,7 @@ def main():
             train_dataset, batch_size=train_cfg["batch_size"],
             shuffle=(train_sampler is None),  # 非 DDP 时全局 shuffle
             sampler=train_sampler,
-            collate_fn=collate_fn, num_workers=4, pin_memory=True,
+            collate_fn=collate, num_workers=4, pin_memory=True,
         )
 
         model.train()
@@ -731,7 +732,7 @@ def main():
             print("\n  评估中 ...")
         test_loader = DataLoader(
             test_dataset, batch_size=train_cfg["batch_size"] * 2,
-            shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True,
+            shuffle=False, collate_fn=collate, num_workers=4, pin_memory=True,
         )
         auc, gauc, logloss = evaluate(model, test_loader, device)
 
