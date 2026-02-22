@@ -29,18 +29,23 @@ from .rankmixer import (
 
 class DINAttention(nn.Module):
     """
-    Deep Interest Network (DIN) 的 target-aware attention.
-    将用户行为序列编码为一个 target-aware 的 embedding 向量。
-    attention(e_i, e_target) = softmax(MLP(e_i, e_target, e_i - e_target, e_i * e_target))
+    Deep Interest Network (DIN) 的 target-aware attention (对齐 FuxiCTR).
+    拼接顺序: [target, seq, target-seq, target*seq] (与 FuxiCTR TargetAttention 一致)
+    hidden_units 可配置，默认 [256, 128] (增大容量，对齐 BARS benchmark)
     """
 
-    def __init__(self, emb_dim: int, hidden_dim: int = 64):
+    def __init__(self, emb_dim: int, hidden_units=None):
         super().__init__()
-        self.attn_mlp = nn.Sequential(
-            nn.Linear(emb_dim * 4, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
+        if hidden_units is None:
+            hidden_units = [256, 128]
+        layers = []
+        input_dim = emb_dim * 4
+        for h in hidden_units:
+            layers.append(nn.Linear(input_dim, h))
+            layers.append(nn.ReLU())
+            input_dim = h
+        layers.append(nn.Linear(input_dim, 1))
+        self.attn_mlp = nn.Sequential(*layers)
 
     def forward(self, seq_emb, target_emb, seq_mask):
         """
@@ -54,10 +59,11 @@ class DINAttention(nn.Module):
         S = seq_emb.size(1)
         target_exp = target_emb.unsqueeze(1).expand_as(seq_emb)  # [B, S, E]
 
+        # P4: 拼接顺序对齐 FuxiCTR: [target, seq, target-seq, target*seq]
         attn_input = torch.cat([
-            seq_emb, target_exp,
-            seq_emb - target_exp,
-            seq_emb * target_exp,
+            target_exp, seq_emb,
+            target_exp - seq_emb,
+            target_exp * seq_emb,
         ], dim=-1)  # [B, S, 4E]
 
         attn_score = self.attn_mlp(attn_input).squeeze(-1)  # [B, S]
@@ -98,18 +104,20 @@ class BaseCTR(nn.Module):
         self.user_emb = nn.Embedding(data_cfg["num_users"], user_emb_dim)
         self.item_emb = nn.Embedding(data_cfg["item_hash_size"], item_emb_dim)
 
+        # P2: xavier_uniform_ 初始化 embedding (对齐 FuxiCTR)
+        nn.init.xavier_uniform_(self.user_emb.weight)
+        nn.init.xavier_uniform_(self.item_emb.weight)
+
         # Pretrained embedding 投影层 (与 FuxiCTR 对齐: nn.Linear(64,64,bias=False))
         if self.use_pretrained:
             self.vis_proj = nn.Linear(item_vis_dim, item_vis_dim, bias=False)
 
-        # DIN 序列注意力: 双通道 (item_id_emb + item_vis_emb) → DIN
-        # 序列 embedding 维度 = item_emb_dim + item_vis_dim (与 FuxiCTR 对齐)
-        # 与 BARS benchmark 对齐: 只对 pos 序列做 DIN，neg 序列不参与建模
+        # P1: DIN 序列注意力, hidden_units 可配置 (默认 [256, 128], 增大容量)
         seq_emb_dim = item_emb_dim + item_vis_dim if self.use_pretrained else item_emb_dim
-        self.pos_din_attn = DINAttention(seq_emb_dim, hidden_dim=64)
+        din_hidden_units = model_cfg.get("din_hidden_units", [256, 128])
+        self.pos_din_attn = DINAttention(seq_emb_dim, hidden_units=din_hidden_units)
 
         # total_dim: user_emb + item_emb + item_vis + pos_seq_enc
-        # 无 neg_seq_enc, 无 is_like/is_follow (与 BARS benchmark 对齐)
         total_dim = (user_emb_dim + item_emb_dim + item_vis_dim
                      + seq_emb_dim)
         self.num_tokens = math.ceil(total_dim / chunk_size)
@@ -120,13 +128,17 @@ class BaseCTR(nn.Module):
 
         self.proj = nn.Linear(chunk_size, hidden_dim)
 
-    def _get_embedding_reg_loss(self):
-        """计算 embedding L2 正则损失 (与 FuxiCTR 对齐: λ/p * ||W||_p^p, p=2)"""
+    def _get_embedding_reg_loss(self, u_emb, i_emb):
+        """
+        P0: 计算 batch-level embedding L2 正则损失。
+        只对当前 batch 中实际用到的 embedding 向量做正则, 而非整个 weight 矩阵。
+        公式: λ/2 * (mean(||u_emb||^2) + mean(||i_emb||^2))
+        """
         if self.embedding_regularizer <= 0:
-            return torch.tensor(0.0)
+            return torch.tensor(0.0, device=u_emb.device)
         reg = self.embedding_regularizer / 2.0 * (
-            self.user_emb.weight.norm(2).pow(2) +
-            self.item_emb.weight.norm(2).pow(2)
+            u_emb.norm(2, dim=-1).pow(2).mean() +
+            i_emb.norm(2, dim=-1).pow(2).mean()
         )
         return reg
 
@@ -137,6 +149,8 @@ class BaseCTR(nn.Module):
         公共前处理 (与 BARS benchmark 对齐):
         embedding → vis_proj → DIN双通道序列编码(仅pos) → concat → pad → chunk → proj → [B, T, D]
         neg 序列不参与建模 (与 BARS benchmark 所有模型一致)
+
+        Returns: (tokens [B, T, D], u_emb [B, E], i_emb [B, E])
         """
         u_emb = self.user_emb(user_ids)       # [B, user_emb_dim]
         i_emb = self.item_emb(item_ids)       # [B, item_emb_dim]
@@ -169,7 +183,7 @@ class BaseCTR(nn.Module):
             e_input = F.pad(e_input, (0, self.padded_dim - e_input.size(-1)))
 
         tokens = e_input.view(B, self.num_tokens, self.chunk_size)
-        return self.proj(tokens)  # [B, T, D]
+        return self.proj(tokens), u_emb, i_emb  # [B, T, D], [B, E], [B, E]
 
 
 # ============================================================
@@ -189,6 +203,9 @@ class RankMixerCTR(BaseCTR):
         num_experts = model_cfg["num_experts"]
         l1_lambda = model_cfg["l1_lambda"]
 
+        # P3: output_head MLP (可配置, 默认 [256])
+        output_head_units = model_cfg.get("output_head_units", [256])
+
         print(f"  [RankMixer] Feature dim: {self.total_dim}, Tokens (T): {T}, "
               f"Hidden (D): {hidden_dim}, D/T: {hidden_dim // T}")
         print(f"  Dense layers: {num_dense}, MoE layers: {num_moe}, "
@@ -201,15 +218,21 @@ class RankMixerCTR(BaseCTR):
             RankMixerMoEBlock(T, hidden_dim, num_experts, ffn_exp, l1_lambda)
             for _ in range(num_moe)
         ])
-        self.output_head = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, 1),
-        )
+
+        # P3: MLP 预测头 (LayerNorm → MLP → Linear(1))
+        head_layers = [nn.LayerNorm(hidden_dim)]
+        in_dim = hidden_dim
+        for h_dim in output_head_units:
+            head_layers.append(nn.Linear(in_dim, h_dim))
+            head_layers.append(nn.ReLU())
+            in_dim = h_dim
+        head_layers.append(nn.Linear(in_dim, 1))
+        self.output_head = nn.Sequential(*head_layers)
 
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
                 pos_items_vis, neg_items_vis):
-        x = self._tokenize(user_ids, item_ids, item_vis,
+        x, u_emb, i_emb = self._tokenize(user_ids, item_ids, item_vis,
                            pos_items, pos_lens, neg_items, neg_lens,
                            pos_items_vis, neg_items_vis)
 
@@ -221,8 +244,8 @@ class RankMixerCTR(BaseCTR):
             x, reg = blk(x)
             total_reg = total_reg + reg
 
-        # 加上 embedding L2 正则
-        total_reg = total_reg + self._get_embedding_reg_loss().to(x.device)
+        # P0: batch-level embedding L2 正则
+        total_reg = total_reg + self._get_embedding_reg_loss(u_emb, i_emb)
 
         x = x.mean(dim=1)
         logits = self.output_head(x).squeeze(-1)
@@ -288,15 +311,21 @@ class TokenMixerLargeCTR(BaseCTR):
                 nn.Linear(hidden_dim, 1),
             )
 
-        self.output_head = nn.Sequential(
-            RMSNorm(hidden_dim),
-            nn.Linear(hidden_dim, 1),
-        )
+        # P3: MLP 预测头 (主输出)
+        output_head_units = model_cfg.get("output_head_units", [256])
+        head_layers = [RMSNorm(hidden_dim)]
+        in_dim = hidden_dim
+        for h_dim in output_head_units:
+            head_layers.append(nn.Linear(in_dim, h_dim))
+            head_layers.append(nn.ReLU())
+            in_dim = h_dim
+        head_layers.append(nn.Linear(in_dim, 1))
+        self.output_head = nn.Sequential(*head_layers)
 
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
                 pos_items_vis, neg_items_vis):
-        tokens = self._tokenize(user_ids, item_ids, item_vis,
+        tokens, u_emb, i_emb = self._tokenize(user_ids, item_ids, item_vis,
                                 pos_items, pos_lens, neg_items, neg_lens,
                                 pos_items_vis, neg_items_vis)
         B = tokens.size(0)
@@ -325,7 +354,12 @@ class TokenMixerLargeCTR(BaseCTR):
         else:
             aux_logits = torch.zeros_like(main_logits)
 
-        return main_logits, aux_logits
+        # P0: 将 batch-level embedding reg 加到 aux_logits 的 "meta" 中
+        # 训练循环会单独处理 tokenmixer_large 的 aux_logits (用于辅助 loss)
+        # 所以这里返回第三个值: embedding reg loss
+        emb_reg = self._get_embedding_reg_loss(u_emb, i_emb)
+
+        return main_logits, aux_logits, emb_reg
 
 
 # ============================================================
@@ -338,8 +372,7 @@ class TransformerCTR(BaseCTR):
     最简单的 Transformer baseline:
     - 继承 BaseCTR 复用 embedding + DIN 序列编码 + chunk tokenization
     - 标准 Pre-LN Transformer: LayerNorm → MHSA → residual → LayerNorm → FFN → residual
-    - Mean pooling → 预测头
-    - 无 MoE、无 global token、无花哨设计
+    - Mean pooling → MLP 预测头
     """
 
     def __init__(self, cfg):
@@ -352,6 +385,9 @@ class TransformerCTR(BaseCTR):
         num_heads = model_cfg["num_heads"]
         ffn_expansion = model_cfg.get("ffn_expansion", 4)
         dropout = model_cfg.get("dropout", 0.0)
+
+        # P3: output_head MLP (可配置, 默认 [256])
+        output_head_units = model_cfg.get("output_head_units", [256])
 
         print(f"  [Transformer] Feature dim: {self.total_dim}, Tokens (T): {T}, "
               f"Hidden (D): {hidden_dim}, Heads: {num_heads}, "
@@ -373,21 +409,26 @@ class TransformerCTR(BaseCTR):
             enable_nested_tensor=False,
         )
 
-        self.output_head = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, 1),
-        )
+        # P3: MLP 预测头
+        head_layers = [nn.LayerNorm(hidden_dim)]
+        in_dim = hidden_dim
+        for h_dim in output_head_units:
+            head_layers.append(nn.Linear(in_dim, h_dim))
+            head_layers.append(nn.ReLU())
+            in_dim = h_dim
+        head_layers.append(nn.Linear(in_dim, 1))
+        self.output_head = nn.Sequential(*head_layers)
 
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
                 pos_items_vis, neg_items_vis):
-        x = self._tokenize(user_ids, item_ids, item_vis,
+        x, u_emb, i_emb = self._tokenize(user_ids, item_ids, item_vis,
                            pos_items, pos_lens, neg_items, neg_lens,
                            pos_items_vis, neg_items_vis)
         x = self.encoder(x)
         x = x.mean(dim=1)
         logits = self.output_head(x).squeeze(-1)
-        reg_loss = self._get_embedding_reg_loss().to(logits.device)
+        reg_loss = self._get_embedding_reg_loss(u_emb, i_emb)
         return logits, reg_loss
 
 
@@ -438,6 +479,10 @@ class HSTUCTR(nn.Module):
         self.user_emb = nn.Embedding(data_cfg["num_users"], user_emb_dim)
         self.item_emb = nn.Embedding(data_cfg["item_hash_size"], item_emb_dim)
 
+        # P2: xavier_uniform_ 初始化 embedding (对齐 FuxiCTR)
+        nn.init.xavier_uniform_(self.user_emb.weight)
+        nn.init.xavier_uniform_(self.item_emb.weight)
+
         # Pretrained embedding 投影层 (与 FuxiCTR 对齐)
         if self.use_pretrained:
             self.vis_proj = nn.Linear(item_vis_dim, item_vis_dim, bias=False)
@@ -445,6 +490,7 @@ class HSTUCTR(nn.Module):
         # Action embedding: click=0, like=1, follow=2, skip/neg=3
         num_action_types = 4
         self.action_emb = nn.Embedding(num_action_types, item_emb_dim)
+        nn.init.xavier_uniform_(self.action_emb.weight)
 
         # 投影层: content token (item_emb + item_vis → hidden_dim)
         self.content_proj = nn.Linear(item_emb_dim + item_vis_dim, hidden_dim)
@@ -475,18 +521,24 @@ class HSTUCTR(nn.Module):
             for _ in range(num_layers)
         ])
 
-        self.output_head = nn.Sequential(
-            HSTURMSNorm(hidden_dim),
-            nn.Linear(hidden_dim, 1),
-        )
+        # P3: MLP 预测头 (可配置)
+        output_head_units = model_cfg.get("output_head_units", [256])
+        head_layers = [HSTURMSNorm(hidden_dim)]
+        in_dim = hidden_dim
+        for h_dim in output_head_units:
+            head_layers.append(nn.Linear(in_dim, h_dim))
+            head_layers.append(nn.ReLU())
+            in_dim = h_dim
+        head_layers.append(nn.Linear(in_dim, 1))
+        self.output_head = nn.Sequential(*head_layers)
 
-    def _get_embedding_reg_loss(self):
-        """计算 embedding L2 正则损失 (与 FuxiCTR 对齐: λ/p * ||W||_p^p, p=2)"""
+    def _get_embedding_reg_loss(self, u_emb, i_emb):
+        """P0: batch-level embedding L2 正则损失"""
         if self.embedding_regularizer <= 0:
-            return torch.tensor(0.0)
+            return torch.tensor(0.0, device=u_emb.device)
         reg = self.embedding_regularizer / 2.0 * (
-            self.user_emb.weight.norm(2).pow(2) +
-            self.item_emb.weight.norm(2).pow(2)
+            u_emb.norm(2, dim=-1).pow(2).mean() +
+            i_emb.norm(2, dim=-1).pow(2).mean()
         )
         return reg
 
@@ -504,11 +556,9 @@ class HSTUCTR(nn.Module):
         S = pos_items.size(1)  # max_seq_len
 
         # --- 构造各种 token ---
-        # 1. User prefix token: user_emb → [B, hidden_dim]
         u_emb = self.user_emb(user_ids)                            # [B, user_emb_dim]
         user_token = self.user_proj(u_emb)
 
-        # 2. Pos content tokens for history: item_emb + item_vis (双通道)
         pos_item_emb = self.item_emb(pos_items)                    # [B, S, item_emb_dim]
         if self.use_pretrained:
             pos_vis_proj = self.vis_proj(pos_items_vis)             # [B, S, vis_dim]
@@ -517,11 +567,9 @@ class HSTUCTR(nn.Module):
             pos_content_input = pos_item_emb
         pos_content_tokens = self.content_proj(pos_content_input)  # [B, S, D]
 
-        # 3. Pos action tokens (click = 0)
         pos_action_ids = torch.zeros(B, S, dtype=torch.long, device=device)
         pos_action_tokens = self.action_proj(self.action_emb(pos_action_ids))  # [B, S, D]
 
-        # 4. Target content token: item_emb + item_vis (双通道)
         i_emb = self.item_emb(item_ids)                            # [B, item_emb_dim]
         if self.use_pretrained:
             target_vis = self.vis_proj(item_vis)                   # [B, vis_dim]
@@ -530,11 +578,9 @@ class HSTUCTR(nn.Module):
             target_token = self.content_proj(i_emb)
 
         # --- 构造交替序列 (仅 pos) ---
-        # Pos interleaved: [Φ_0, a_0, Φ_1, a_1, ...] → [B, 2S, D]
         pos_interleaved = torch.stack([pos_content_tokens, pos_action_tokens], dim=2)
         pos_interleaved = pos_interleaved.view(B, S * 2, self.hidden_dim)
 
-        # 拼接: [user(1), pos(2S), target(1)] = [B, 2S+2, D]
         full_seq = torch.cat([
             user_token.unsqueeze(1),       # [B, 1, D]
             pos_interleaved,               # [B, 2S, D]
@@ -542,15 +588,12 @@ class HSTUCTR(nn.Module):
         ], dim=1)  # [B, 2S+2, D]
 
         # --- 构造 attention mask ---
-        # valid 长度: 1 (user) + pos_len*2 + 1 (target)
         valid_lens = 1 + pos_lens * 2 + 1  # [B]
         total_len = full_seq.size(1)       # 2S+2
 
-        # padding mask: [B, total_len], True = valid
         pos_indices = torch.arange(total_len, device=device).unsqueeze(0)
         padding_mask = pos_indices < valid_lens.unsqueeze(1)
 
-        # attention mask: [B, 1, total_len, total_len]
         attn_mask = padding_mask.unsqueeze(1).unsqueeze(2)
         attn_mask = attn_mask.expand(B, 1, total_len, total_len)
 
@@ -565,7 +608,8 @@ class HSTUCTR(nn.Module):
         target_hidden = x.gather(1, target_idx).squeeze(1)         # [B, D]
 
         logits = self.output_head(target_hidden).squeeze(-1)
-        reg_loss = self._get_embedding_reg_loss().to(logits.device)
+        # P0: batch-level embedding reg
+        reg_loss = self._get_embedding_reg_loss(u_emb, i_emb)
         return logits, reg_loss
 
 

@@ -38,6 +38,8 @@ model:
   ffn_expansion: 4                       # k
   num_experts: 8                         # E=8
   l1_lambda: 0.01                        # MoE L1 稀疏正则系数
+  din_hidden_units: [256, 128]           # P1: DIN attention MLP 隐藏层
+  output_head_units: [256]               # P3: 预测头 MLP 隐藏层
 
 # --- 训练配置 ---
 training:

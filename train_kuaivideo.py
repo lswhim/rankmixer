@@ -382,13 +382,14 @@ def evaluate(model, dataloader, device, use_fp16=False):
              pos_items, pos_lens, neg_items, neg_lens,
              pos_vis, neg_vis, labels) = batch
             with torch.cuda.amp.autocast(enabled=use_fp16):
-                logits, _ = raw_model(
+                output = raw_model(
                     uids.to(device), iids.to(device),
                     i_vis.to(device),
                     pos_items.to(device), pos_lens.to(device),
                     neg_items.to(device), neg_lens.to(device),
                     pos_vis.to(device), neg_vis.to(device),
                 )
+                logits = output[0]
             probs = torch.sigmoid(logits.float()).cpu()
             all_labels.append(labels)
             all_preds.append(probs)
@@ -662,24 +663,27 @@ def main():
             amp_ctx = torch.cuda.amp.autocast(enabled=use_fp16)
 
             with sync_ctx, amp_ctx:
-                main_logits, aux_output = model(
+                model_output = model(
                     uids, iids, i_vis,
                     pos_items, pos_lens, neg_items, neg_lens,
                     pos_vis, neg_vis,
                 )
 
-                main_loss = criterion(main_logits, labels)
-
                 if arch == "tokenmixer_large":
-                    if aux_output.abs().sum() > 0:
-                        aux_loss = criterion(aux_output, labels)
+                    # TokenMixer-Large returns (main_logits, aux_logits, emb_reg)
+                    main_logits, aux_logits_tm, emb_reg = model_output
+                    main_loss = criterion(main_logits, labels)
+                    if aux_logits_tm.abs().sum() > 0:
+                        aux_loss = criterion(aux_logits_tm, labels)
                         loss = main_loss + aux_loss_weight * aux_loss
                     else:
                         loss = main_loss
                         aux_loss = torch.tensor(0.0)
-                    raw = model.module if hasattr(model, "module") else model
-                    loss = loss + raw._get_embedding_reg_loss().to(device)
+                    loss = loss + emb_reg
                 else:
+                    # Other models return (main_logits, aux_output)
+                    main_logits, aux_output = model_output
+                    main_loss = criterion(main_logits, labels)
                     loss = main_loss + aux_output
                     aux_loss = aux_output
 

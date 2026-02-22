@@ -259,6 +259,10 @@ class DMINCTR(nn.Module):
         self.user_emb = nn.Embedding(data_cfg["num_users"], user_emb_dim)
         self.item_emb = nn.Embedding(data_cfg["item_hash_size"], item_emb_dim)
 
+        # P2: xavier_uniform_ 初始化 embedding (对齐 FuxiCTR)
+        nn.init.xavier_uniform_(self.user_emb.weight)
+        nn.init.xavier_uniform_(self.item_emb.weight)
+
         if self.use_pretrained:
             self.vis_proj = nn.Linear(item_vis_dim, item_vis_dim, bias=False)
 
@@ -322,13 +326,13 @@ class DMINCTR(nn.Module):
 
         self.num_heads = num_heads
 
-    def _get_embedding_reg_loss(self):
-        """与 FuxiCTR 对齐: (λ/2) * ||W||_2^2"""
+    def _get_embedding_reg_loss(self, u_emb, i_emb):
+        """P0: batch-level embedding L2 正则"""
         if self.embedding_regularizer <= 0:
-            return torch.tensor(0.0)
+            return torch.tensor(0.0, device=u_emb.device)
         reg = self.embedding_regularizer / 2.0 * (
-            self.user_emb.weight.norm(2).pow(2) +
-            self.item_emb.weight.norm(2).pow(2)
+            u_emb.norm(2, dim=-1).pow(2).mean() +
+            i_emb.norm(2, dim=-1).pow(2).mean()
         )
         return reg
 
@@ -398,5 +402,5 @@ class DMINCTR(nn.Module):
         # DNN prediction
         logits = self.dnn(concat_emb).squeeze(-1)  # [B]
 
-        reg_loss = self._get_embedding_reg_loss().to(logits.device)
+        reg_loss = self._get_embedding_reg_loss(u_emb, i_emb)
         return logits, reg_loss
