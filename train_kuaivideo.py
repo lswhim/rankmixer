@@ -650,8 +650,8 @@ def main():
 
             # DDP: 非累积最后一步时关闭梯度同步，节省通信开销
             is_accum_last = ((step + 1) % accum_steps == 0)
-            ctx = model.no_sync() if (is_dist() and not is_accum_last) else \
-                  torch.contextmanager(lambda: (yield))()
+            from contextlib import nullcontext
+            ctx = model.no_sync() if (is_dist() and not is_accum_last) else nullcontext()
 
             with ctx:
                 main_logits, aux_output = model(
