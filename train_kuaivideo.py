@@ -440,7 +440,7 @@ def main():
 
     if is_main_process():
         print("=" * 60)
-        arch_names = {"rankmixer": "RankMixer", "tokenmixer_large": "TokenMixer-Large", "hstu": "HSTU", "transformer": "Transformer"}
+        arch_names = {"rankmixer": "RankMixer", "tokenmixer_large": "TokenMixer-Large", "hstu": "HSTU", "transformer": "Transformer", "dmin": "DMIN"}
         print(f"{arch_names.get(arch, arch)} on KuaiVideo_x1")
         print(f"Config: {args.config}")
         print(f"Device: {device} | World size: {world_size}")
@@ -578,8 +578,7 @@ def main():
                 loss = loss + raw._get_embedding_reg_loss().to(device)
             else:
                 # rankmixer: aux_output = MoE L1 reg + embedding L2 reg
-                # hstu: aux_output = embedding L2 reg
-                # transformer: aux_output = embedding L2 reg
+                # hstu/transformer/dmin: aux_output = embedding L2 reg
                 loss = main_loss + aux_output
                 aux_loss = aux_output
 
@@ -611,7 +610,7 @@ def main():
                 avg = epoch_loss / epoch_samples
                 elapsed = time.time() - t0
                 speed = epoch_samples / elapsed
-                aux_name = {"tokenmixer_large": "Aux", "rankmixer": "Reg"}.get(arch, "Aux")
+                aux_name = {"tokenmixer_large": "Aux", "rankmixer": "Reg", "dmin": "Reg"}.get(arch, "Reg")
                 print(
                     f"  Step {step:5d} | "
                     f"Samples: {epoch_samples:>8d} | "

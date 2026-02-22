@@ -1,0 +1,76 @@
+# ============================================================
+# DMIN on KuaiVideo_x1 (严格复现 BARS benchmark)
+# BARS 最佳配置: DMIN_kuaivideo_x1_020_d155f57e
+# 目标: gAUC=0.672621, AUC=0.750777, logloss=0.430187
+#
+# 参考:
+#   https://github.com/reczoo/BARS/tree/main/ranking/ctr/DMIN/DMIN_kuaivideo_x1
+#   https://github.com/reczoo/FuxiCTR/blob/v2.3.7/model_zoo/DMIN/src/DMIN.py
+# ============================================================
+
+# --- 数据配置 (与 FuxiCTR benchmark 对齐) ---
+data:
+  use_pretrained_emb: true
+  data_dir: "KuaiVideo_x1"
+  train_file: "train.csv"
+  test_file: "test.csv"
+  item_emb_file: "item_visual_emb_dim64.h5"
+  num_users: 10000
+  num_items: 3242316
+  item_hash_size: 3250000
+  item_vis_dim: 64
+  max_seq_len: 100
+  embedding_regularizer: 1.0e-4          # L2 正则 (与 FuxiCTR 对齐)
+
+# --- 特征 Embedding 配置 ---
+embedding:
+  user_emb_dim: 64
+  item_emb_dim: 64
+
+# --- DMIN 模型配置 (BARS 最佳超参) ---
+model:
+  arch: "dmin"
+  # MultiInterestExtractor
+  num_heads: 2                           # BARS 最佳: 2
+  attention_dropout: 0.2                 # BARS 最佳: 0.2
+  attention_hidden_units: [512, 256]     # BARS 配置
+  attention_activation: "ReLU"           # BARS 配置
+  # DNN
+  dnn_hidden_units: [1024, 512, 256]     # BARS 配置
+  dnn_activation: "Dice"                 # BARS 配置
+  net_dropout: 0.1                       # BARS 配置
+  # BARS 最佳: 不使用以下组件
+  # use_behavior_refiner: false (代码中未实现, 因为 BARS 最佳不用)
+  # use_pos_emb: false (代码中未实现, 因为 BARS 最佳不用)
+  # aux_loss_lambda: 0 (代码中未实现, 因为 BARS 最佳不用)
+  # enable_sum_pooling: false (代码中未实现, 因为 BARS 最佳不用)
+
+# --- 训练配置 (与 FuxiCTR benchmark 完全对齐) ---
+training:
+  batch_size: 4096
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  num_epochs: 100
+  grad_clip_norm: 10.0
+  optimizer: "adam"
+  scheduler: "reduce_lr_on_plateau"
+  reduce_lr_on_plateau: true
+  lr_decay_factor: 0.1
+  scheduler_eta_min: 1.0e-6
+  early_stop_patience: 2
+  shuffle_buffer: 50000
+
+# --- 日志与评估配置 ---
+logging:
+  log_interval: 200
+  eval_samples: 0
+  save_path: "dmin_small_kuaivideo.pt"
+  save_best: true
+
+# --- 设备配置 ---
+device: "auto"
+
+# --- wandb 配置 ---
+wandb:
+  project: "rankmixer"
+  tags: ["dmin", "baseline", "bars_reproduce"]

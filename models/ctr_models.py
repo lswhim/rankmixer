@@ -606,5 +606,8 @@ def build_model(cfg) -> nn.Module:
         return HSTUCTR(cfg)
     elif arch == "transformer":
         return TransformerCTR(cfg)
+    elif arch == "dmin":
+        from .dmin import DMINCTR
+        return DMINCTR(cfg)
     else:
         return RankMixerCTR(cfg)
