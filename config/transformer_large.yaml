@@ -49,6 +49,7 @@ training:
   scheduler: "cosine"
   scheduler_eta_min: 1.0e-6
   warmup_steps: 1000
+  fp16: true
   gradient_accumulation_steps: 4
   early_stop_patience: 5
 
