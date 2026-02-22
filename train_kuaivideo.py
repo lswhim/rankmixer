@@ -367,7 +367,7 @@ def compute_gauc(user_ids, labels, preds):
     return total_auc / total_count
 
 
-def evaluate(model, dataloader, device, use_fp16=False):
+def evaluate(model, dataloader, device):
     """
     评估模型。DDP 模式下每个 rank 各自跑一部分数据，
     通过 all_gather 汇总到 rank 0 计算全局指标。
@@ -381,7 +381,7 @@ def evaluate(model, dataloader, device, use_fp16=False):
             (uids, iids, i_vis,
              pos_items, pos_lens, neg_items, neg_lens,
              pos_vis, neg_vis, labels) = batch
-            with torch.cuda.amp.autocast(enabled=use_fp16):
+            with torch.no_grad():
                 output = raw_model(
                     uids.to(device), iids.to(device),
                     i_vis.to(device),
@@ -608,12 +608,6 @@ def main():
               f"effective batch_size={train_cfg['batch_size']}, "
               f"micro_batch_size={micro_batch_size}")
 
-    # FP16 混合精度训练
-    use_fp16 = train_cfg.get("fp16", False) and device.startswith("cuda")
-    scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
-    if is_main_process():
-        print(f"FP16 混合精度: {'ON' if use_fp16 else 'OFF'}")
-
     global_step = 0
 
     for epoch in range(train_cfg["num_epochs"]):
@@ -660,9 +654,8 @@ def main():
             is_accum_last = ((step + 1) % accum_steps == 0)
             from contextlib import nullcontext
             sync_ctx = model.no_sync() if (is_dist() and not is_accum_last) else nullcontext()
-            amp_ctx = torch.cuda.amp.autocast(enabled=use_fp16)
 
-            with sync_ctx, amp_ctx:
+            with sync_ctx:
                 model_output = model(
                     uids, iids, i_vis,
                     pos_items, pos_lens, neg_items, neg_lens,
@@ -690,8 +683,8 @@ def main():
                 # 梯度累积: loss 除以 accum_steps 保证有效梯度与不累积时一致
                 scaled_loss = loss / accum_steps
 
-            # scaler 处理反向传播 (AMP: fp16 梯度缩放防止 underflow)
-            scaler.scale(scaled_loss).backward()
+            # 反向传播
+            scaled_loss.backward()
 
             bs = labels.size(0)
             epoch_loss += main_loss.item() * bs
@@ -700,12 +693,10 @@ def main():
 
             # 累积够 accum_steps 步后执行 optimizer.step()
             if is_accum_last:
-                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), max_norm=train_cfg["grad_clip_norm"]
                 )
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 optimizer.zero_grad()
                 optim_step += 1
                 global_step += 1
@@ -742,12 +733,10 @@ def main():
 
         # 处理尾部不足 accum_steps 的剩余梯度
         if step % accum_steps != 0:
-            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), max_norm=train_cfg["grad_clip_norm"]
             )
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             optimizer.zero_grad()
             global_step += 1
 
@@ -778,7 +767,7 @@ def main():
             test_dataset, batch_size=train_cfg["batch_size"] * 2,
             shuffle=False, collate_fn=collate, num_workers=4, pin_memory=True,
         )
-        auc, gauc, logloss = evaluate(model, test_loader, device, use_fp16=use_fp16)
+        auc, gauc, logloss = evaluate(model, test_loader, device)
 
         # Early stopping: rank 0 判断是否提升，广播给所有 rank
         should_stop = False
