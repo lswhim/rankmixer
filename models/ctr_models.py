@@ -104,14 +104,14 @@ class BaseCTR(nn.Module):
 
         # DIN 序列注意力: 双通道 (item_id_emb + item_vis_emb) → DIN
         # 序列 embedding 维度 = item_emb_dim + item_vis_dim (与 FuxiCTR 对齐)
+        # 与 BARS benchmark 对齐: 只对 pos 序列做 DIN，neg 序列不参与建模
         seq_emb_dim = item_emb_dim + item_vis_dim if self.use_pretrained else item_emb_dim
         self.pos_din_attn = DINAttention(seq_emb_dim, hidden_dim=64)
-        self.neg_din_attn = DINAttention(seq_emb_dim, hidden_dim=64)
 
-        # total_dim: user_emb + item_emb + item_vis + pos_seq_enc + neg_seq_enc
-        # 无 is_like/is_follow (与 FuxiCTR benchmark 对齐)
+        # total_dim: user_emb + item_emb + item_vis + pos_seq_enc
+        # 无 neg_seq_enc, 无 is_like/is_follow (与 BARS benchmark 对齐)
         total_dim = (user_emb_dim + item_emb_dim + item_vis_dim
-                     + seq_emb_dim + seq_emb_dim)
+                     + seq_emb_dim)
         self.num_tokens = math.ceil(total_dim / chunk_size)
         self.padded_dim = self.num_tokens * chunk_size
         self.chunk_size = chunk_size
@@ -134,8 +134,9 @@ class BaseCTR(nn.Module):
                   pos_items, pos_lens, neg_items, neg_lens,
                   pos_items_vis, neg_items_vis):
         """
-        公共前处理 (与 FuxiCTR benchmark 对齐):
-        embedding → vis_proj → DIN双通道序列编码(pos+neg) → concat → pad → chunk → proj → [B, T, D]
+        公共前处理 (与 BARS benchmark 对齐):
+        embedding → vis_proj → DIN双通道序列编码(仅pos) → concat → pad → chunk → proj → [B, T, D]
+        neg 序列不参与建模 (与 BARS benchmark 所有模型一致)
         """
         u_emb = self.user_emb(user_ids)       # [B, user_emb_dim]
         i_emb = self.item_emb(item_ids)       # [B, item_emb_dim]
@@ -149,27 +150,18 @@ class BaseCTR(nn.Module):
             pos_vis_proj = self.vis_proj(pos_items_vis)      # [B, S, vis_dim]
             pos_seq_emb = torch.cat([pos_id_emb, pos_vis_proj], dim=-1)  # [B, S, seq_emb_dim]
             target_seq = torch.cat([i_emb, item_vis_proj], dim=-1)       # [B, seq_emb_dim]
-
-            # DIN: neg 双通道
-            neg_id_emb = self.item_emb(neg_items)           # [B, S, item_emb_dim]
-            neg_vis_proj = self.vis_proj(neg_items_vis)      # [B, S, vis_dim]
-            neg_seq_emb = torch.cat([neg_id_emb, neg_vis_proj], dim=-1)  # [B, S, seq_emb_dim]
         else:
             item_vis_proj = None
             pos_seq_emb = self.item_emb(pos_items)
-            neg_seq_emb = self.item_emb(neg_items)
             target_seq = i_emb
 
         pos_mask = torch.arange(pos_items.size(1), device=pos_items.device).unsqueeze(0) < pos_lens.unsqueeze(1)
         pos_enc = self.pos_din_attn(pos_seq_emb, target_seq, pos_mask)  # [B, seq_emb_dim]
 
-        neg_mask = torch.arange(neg_items.size(1), device=neg_items.device).unsqueeze(0) < neg_lens.unsqueeze(1)
-        neg_enc = self.neg_din_attn(neg_seq_emb, target_seq, neg_mask)  # [B, seq_emb_dim]
-
         parts = [u_emb, i_emb]
         if self.use_pretrained:
             parts.append(item_vis_proj)
-        parts.extend([pos_enc, neg_enc])
+        parts.append(pos_enc)
         e_input = torch.cat(parts, dim=-1)
 
         B = e_input.size(0)
@@ -461,9 +453,9 @@ class HSTUCTR(nn.Module):
         # 投影层: user prefix token (user_emb → hidden_dim, 无 is_like/is_follow)
         self.user_proj = nn.Linear(user_emb_dim, hidden_dim)
 
-        # 序列最长: 1 (user prefix) + max_seq_len * 2 (pos content+action)
-        #         + max_seq_len * 2 (neg content+action) + 1 (target)
-        max_tokens = 1 + max_seq_len * 4 + 1 + 8  # 留余量
+        # 序列最长: 1 (user prefix) + max_seq_len * 2 (pos content+action) + 1 (target)
+        # 与 BARS benchmark 对齐: neg 序列不参与建模
+        max_tokens = 1 + max_seq_len * 2 + 1 + 8  # 留余量
         self.max_seq_len = max_seq_len
 
         print(f"  [HSTU] Hidden (D): {hidden_dim}, Heads: {num_heads}, "
@@ -503,7 +495,8 @@ class HSTUCTR(nn.Module):
                 pos_items_vis, neg_items_vis):
         """
         构造 Content-Action 交替序列并通过 HSTU Layers。
-        序列: [user_prefix, pos_Φ_0, pos_a_0, ..., neg_Φ_0, neg_a_0, ..., Φ_target]
+        与 BARS benchmark 对齐: 只使用 pos 序列, neg 序列不参与建模。
+        序列: [user_prefix, pos_Φ_0, pos_a_0, ..., Φ_target]
         取最后一个 token (target content) 的输出做预测。
         """
         B = user_ids.size(0)
@@ -528,20 +521,7 @@ class HSTUCTR(nn.Module):
         pos_action_ids = torch.zeros(B, S, dtype=torch.long, device=device)
         pos_action_tokens = self.action_proj(self.action_emb(pos_action_ids))  # [B, S, D]
 
-        # 4. Neg content tokens for history (双通道)
-        neg_item_emb = self.item_emb(neg_items)                    # [B, S, item_emb_dim]
-        if self.use_pretrained:
-            neg_vis_proj = self.vis_proj(neg_items_vis)             # [B, S, vis_dim]
-            neg_content_input = torch.cat([neg_item_emb, neg_vis_proj], dim=-1)
-        else:
-            neg_content_input = neg_item_emb
-        neg_content_tokens = self.content_proj(neg_content_input)  # [B, S, D]
-
-        # 5. Neg action tokens (neg/skip = 3)
-        neg_action_ids = torch.full((B, S), 3, dtype=torch.long, device=device)
-        neg_action_tokens = self.action_proj(self.action_emb(neg_action_ids))  # [B, S, D]
-
-        # 6. Target content token: item_emb + item_vis (双通道)
+        # 4. Target content token: item_emb + item_vis (双通道)
         i_emb = self.item_emb(item_ids)                            # [B, item_emb_dim]
         if self.use_pretrained:
             target_vis = self.vis_proj(item_vis)                   # [B, vis_dim]
@@ -549,27 +529,22 @@ class HSTUCTR(nn.Module):
         else:
             target_token = self.content_proj(i_emb)
 
-        # --- 构造交替序列 ---
+        # --- 构造交替序列 (仅 pos) ---
         # Pos interleaved: [Φ_0, a_0, Φ_1, a_1, ...] → [B, 2S, D]
         pos_interleaved = torch.stack([pos_content_tokens, pos_action_tokens], dim=2)
         pos_interleaved = pos_interleaved.view(B, S * 2, self.hidden_dim)
 
-        # Neg interleaved: [Φ_0, a_0, Φ_1, a_1, ...] → [B, 2S, D]
-        neg_interleaved = torch.stack([neg_content_tokens, neg_action_tokens], dim=2)
-        neg_interleaved = neg_interleaved.view(B, S * 2, self.hidden_dim)
-
-        # 拼接: [user(1), pos(2S), neg(2S), target(1)] = [B, 4S+2, D]
+        # 拼接: [user(1), pos(2S), target(1)] = [B, 2S+2, D]
         full_seq = torch.cat([
             user_token.unsqueeze(1),       # [B, 1, D]
             pos_interleaved,               # [B, 2S, D]
-            neg_interleaved,               # [B, 2S, D]
             target_token.unsqueeze(1),     # [B, 1, D]
-        ], dim=1)  # [B, 4S+2, D]
+        ], dim=1)  # [B, 2S+2, D]
 
         # --- 构造 attention mask ---
-        # valid 长度: 1 (user) + pos_len*2 + neg_len*2 + 1 (target)
-        valid_lens = 1 + pos_lens * 2 + neg_lens * 2 + 1  # [B]
-        total_len = full_seq.size(1)       # 4S+2
+        # valid 长度: 1 (user) + pos_len*2 + 1 (target)
+        valid_lens = 1 + pos_lens * 2 + 1  # [B]
+        total_len = full_seq.size(1)       # 2S+2
 
         # padding mask: [B, total_len], True = valid
         pos_indices = torch.arange(total_len, device=device).unsqueeze(0)
