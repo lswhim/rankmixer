@@ -58,7 +58,6 @@ training:
   lr_decay_factor: 0.1
   scheduler_eta_min: 1.0e-6
   early_stop_patience: 2
-  shuffle_buffer: 50000
 
 # --- 日志与评估配置 ---
 logging:

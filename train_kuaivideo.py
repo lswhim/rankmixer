@@ -18,7 +18,6 @@ import sys
 import csv
 import time
 import math
-import random
 from datetime import datetime
 import argparse
 import numpy as np
@@ -29,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader
 from typing import Tuple
 from sklearn.metrics import roc_auc_score, log_loss
 import wandb
@@ -134,28 +133,42 @@ def load_pretrained_embeddings(cfg):
 # 数据集
 # ============================================================
 
-class KuaiVideoIterDataset(IterableDataset):
-    def __init__(self, csv_path, item_vis_emb, cfg,
-                 max_samples=None, shuffle_buffer=0):
-        self.csv_path = csv_path
+class KuaiVideoMapDataset(torch.utils.data.Dataset):
+    """
+    全量加载 CSV 到内存的 Map-style Dataset (与 FuxiCTR 对齐)。
+    FuxiCTR 将完整数据集加载到内存, 每个 epoch 通过 DataLoader shuffle=True 做全局 shuffle。
+    """
+    def __init__(self, csv_path, item_vis_emb, cfg, max_samples=None):
         self.item_vis_emb = item_vis_emb
         self.num_users = cfg["data"]["num_users"]
         self.item_hash_size = cfg["data"]["item_hash_size"]
-        self.max_samples = max_samples
         self.max_seq_len = cfg["data"].get("max_seq_len", 100)
-        self.shuffle_buffer = shuffle_buffer
         self.use_pretrained = item_vis_emb is not None
         if self.use_pretrained:
             self.item_vis_dim = item_vis_emb.shape[1]
         else:
             self.item_vis_dim = 0
 
+        # 一次性解析全部 CSV 行
+        if is_main_process():
+            print(f"  加载数据到内存: {csv_path}")
+        self.samples = []
+        max_seq = self.max_seq_len
+        with open(csv_path, "r") as f:
+            reader = csv.reader(f)
+            next(reader)  # skip header
+            for row in reader:
+                if max_samples and len(self.samples) >= max_samples:
+                    break
+                self.samples.append(self._parse_row(row, max_seq))
+        if is_main_process():
+            print(f"  加载完成: {len(self.samples)} 条样本")
+
     def _parse_row(self, row, max_seq):
         """解析 CSV 行为样本 tuple (与 FuxiCTR benchmark 对齐: 无 is_like/is_follow, 双通道序列)"""
         user_id = int(row[1])
         item_id = int(row[2])
         label = float(row[3])
-        # is_like = row[4], is_follow = row[5] — 与 FuxiCTR 对齐, 不使用
         uid = min(user_id, self.num_users - 1)
         iid_hash = item_id % self.item_hash_size
 
@@ -184,10 +197,9 @@ class KuaiVideoIterDataset(IterableDataset):
         if neg_len < max_seq:
             neg_ids = neg_ids + [0] * (max_seq - neg_len)
 
-        # 序列视觉 embedding (双通道: ID + visual)
         if self.use_pretrained:
-            pos_vis = self.item_vis_emb[pos_ids]  # [max_seq, vis_dim]
-            neg_vis = self.item_vis_emb[neg_ids]  # [max_seq, vis_dim]
+            pos_vis = self.item_vis_emb[pos_ids]
+            neg_vis = self.item_vis_emb[neg_ids]
         else:
             pos_vis = np.zeros((max_seq, 0), dtype=np.float32)
             neg_vis = np.zeros((max_seq, 0), dtype=np.float32)
@@ -204,47 +216,11 @@ class KuaiVideoIterDataset(IterableDataset):
             label,
         )
 
-    def __iter__(self):
-        rank = get_rank()
-        world_size = get_world_size()
-        count = 0
-        max_seq = self.max_seq_len
-        buf = []
-        buf_size = self.shuffle_buffer
+    def __len__(self):
+        return len(self.samples)
 
-        with open(self.csv_path, "r") as f:
-            reader = csv.reader(f)
-            next(reader)
-            for row_idx, row in enumerate(reader):
-                if self.max_samples and count >= self.max_samples:
-                    break
-                if row_idx % world_size != rank:
-                    continue
-
-                sample = self._parse_row(row, max_seq)
-
-                if buf_size > 0:
-                    buf.append(sample)
-                    if len(buf) >= buf_size:
-                        random.shuffle(buf)
-                        for s in buf:
-                            yield s
-                            count += 1
-                            if self.max_samples and count >= self.max_samples:
-                                return
-                        buf = []
-                else:
-                    yield sample
-                    count += 1
-
-        # flush remaining buffer
-        if buf:
-            random.shuffle(buf)
-            for s in buf:
-                yield s
-                count += 1
-                if self.max_samples and count >= self.max_samples:
-                    return
+    def __getitem__(self, idx):
+        return self.samples[idx]
 
 
 def collate_fn(batch):
@@ -502,6 +478,23 @@ def main():
     train_csv = os.path.join(data_dir, cfg["data"]["train_file"])
     test_csv = os.path.join(data_dir, cfg["data"]["test_file"])
 
+    # 全量加载数据到内存 (与 FuxiCTR 对齐: 全局 shuffle)
+    if is_main_process():
+        print("\n加载训练集 ...")
+    train_dataset = KuaiVideoMapDataset(train_csv, item_vis_emb, cfg)
+    if is_main_process():
+        print("加载测试集 ...")
+    eval_samples = log_cfg["eval_samples"] if log_cfg["eval_samples"] > 0 else None
+    test_dataset = KuaiVideoMapDataset(test_csv, item_vis_emb, cfg, max_samples=eval_samples)
+
+    # DDP: 使用 DistributedSampler
+    if is_dist():
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset, shuffle=True
+        )
+    else:
+        train_sampler = None
+
     best_auc = 0.0
     best_monitor = -1.0  # monitor = gAUC + AUC (与 FuxiCTR 对齐)
     no_improve_count = 0
@@ -526,13 +519,14 @@ def main():
                   f"(lr={optimizer.param_groups[0]['lr']:.2e})")
             print(f"{'='*60}")
 
-        train_dataset = KuaiVideoIterDataset(
-            train_csv, item_vis_emb, cfg,
-            shuffle_buffer=train_cfg.get("shuffle_buffer", 50000),
-        )
+        # DataLoader: shuffle=True 全局 shuffle (与 FuxiCTR 对齐)
+        if is_dist():
+            train_sampler.set_epoch(epoch)
         train_loader = DataLoader(
             train_dataset, batch_size=train_cfg["batch_size"],
-            collate_fn=collate_fn, num_workers=0,
+            shuffle=(train_sampler is None),  # 非 DDP 时全局 shuffle
+            sampler=train_sampler,
+            collate_fn=collate_fn, num_workers=4, pin_memory=True,
         )
 
         model.train()
@@ -648,13 +642,9 @@ def main():
         # --- 评估 ---
         if is_main_process():
             print("\n  评估中 ...")
-        eval_samples = log_cfg["eval_samples"] if log_cfg["eval_samples"] > 0 else None
-        test_dataset = KuaiVideoIterDataset(
-            test_csv, item_vis_emb, cfg, max_samples=eval_samples
-        )
         test_loader = DataLoader(
             test_dataset, batch_size=train_cfg["batch_size"] * 2,
-            collate_fn=collate_fn, num_workers=0,
+            shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True,
         )
         auc, gauc, logloss = evaluate(model, test_loader, device)
 

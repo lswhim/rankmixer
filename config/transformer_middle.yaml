@@ -3,8 +3,8 @@
 #
 # 标准 Transformer 对照组 (中等规模):
 # Pre-LN, Multi-Head Self-Attention + FFN (GELU), Mean Pooling
-# chunk_size=28 → T = ceil(448/28) = 16, D=1024, L=6, H=16, head_dim=64
-# total_dim = 64+64+64+128+128 = 448
+# chunk_size=20 → T = ceil(320/20) = 16, D=1024, L=6, H=16, head_dim=64
+# total_dim = 64+64+64+128 = 320 (与 BARS benchmark 对齐: 无 neg_seq)
 # ============================================================
 
 # --- 数据配置 ---
@@ -29,7 +29,7 @@ embedding:
 # --- Transformer 模型配置 ---
 model:
   arch: "transformer"
-  chunk_size: 28                         # d → T = ceil(448/28) = 16
+  chunk_size: 20                         # d → T = ceil(320/20) = 16
   hidden_dim: 1024                       # D
   num_layers: 6                          # L
   num_heads: 16                          # H (head_dim = 64)
