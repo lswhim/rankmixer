@@ -225,8 +225,8 @@ class TopKRouter(nn.Module):
         top_vals, top_idx = torch.topk(logits, self.top_k, dim=-1)  # [N, k]
         top_vals = F.softmax(top_vals, dim=-1)  # softmax over top-k
 
-        # scatter 到 full expert 维度
-        gate_out = torch.zeros_like(logits)
+        # scatter 到 full expert 维度 (显式对齐 dtype, 兼容 fp16 autocast)
+        gate_out = torch.zeros_like(logits).to(top_vals.dtype)
         gate_out.scatter_(1, top_idx, top_vals)
 
         return gate_out, top_idx
