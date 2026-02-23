@@ -40,7 +40,7 @@ model:
   num_experts: 8                         # (不生效)
   l1_lambda: 0.01                        # (不生效)
   din_hidden_units: [256, 128]           # P1: DIN attention MLP 隐藏层
-  output_head_units: [256]               # P3: 预测头 MLP 隐藏层
+  output_head_units: [1024, 512, 256]    # P3: 预测头 MLP (对齐 DMIN DNN 头)
 
 # --- 训练配置 (与 FuxiCTR benchmark 对齐) ---
 training:

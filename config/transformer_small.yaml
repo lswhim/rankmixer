@@ -36,20 +36,21 @@ model:
   ffn_expansion: 4                       # FFN 扩展倍率
   dropout: 0.0
   din_hidden_units: [256, 128]           # P1: DIN attention MLP 隐藏层
-  output_head_units: [256]               # P3: 预测头 MLP 隐藏层
+  output_head_units: [1024, 512, 256]    # P3: 预测头 MLP (对齐 DMIN DNN 头)
 
-# --- 训练配置 ---
+# --- 训练配置 (与 BARS benchmark 完全对齐) ---
 training:
-  batch_size: 2048
-  learning_rate: 5.0e-4
-  weight_decay: 1.0e-5
+  batch_size: 4096
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
   num_epochs: 100
-  grad_clip_norm: 1.0
-  optimizer: "adamw"
-  scheduler: "cosine"
+  grad_clip_norm: 10.0
+  optimizer: "adam"
+  scheduler: "reduce_lr_on_plateau"
+  reduce_lr_on_plateau: true
+  lr_decay_factor: 0.1
   scheduler_eta_min: 1.0e-6
-  warmup_steps: 500
-  early_stop_patience: 5
+  early_stop_patience: 2
 
 # --- 日志与评估配置 ---
 logging:
