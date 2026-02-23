@@ -62,6 +62,9 @@ logging:
   save_path: "rankmixer_middle_kuaivideo.pt"
   save_best: true
 
+# --- 随机种子 ---
+seed: 42
+
 # --- 设备配置 ---
 device: "auto"
 

@@ -18,6 +18,7 @@ import sys
 import csv
 import time
 import math
+import random
 from datetime import datetime
 import argparse
 import numpy as np
@@ -467,6 +468,18 @@ def main():
     world_size = get_world_size()
 
     cfg = load_config(args.config)
+
+    # --- 随机种子 (可复现) ---
+    seed = cfg.get("seed", 42)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    if is_main_process():
+        print(f"  Random seed: {seed}")
+
     device = get_device(cfg.get("device", "auto"))
     project_root = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(project_root, cfg["data"]["data_dir"])

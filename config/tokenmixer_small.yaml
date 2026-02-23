@@ -63,6 +63,9 @@ logging:
   save_path: "tokenmixer_small_kuaivideo.pt"
   save_best: true
 
+# --- 随机种子 ---
+seed: 42
+
 # --- 设备配置 ---
 device: "auto"
 
