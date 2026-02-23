@@ -328,7 +328,7 @@ def make_collate_fn(item_vis_emb):
 
 from models.ctr_models import (
     DINAttention, BaseCTR, RankMixerCTR, TokenMixerLargeCTR,
-    SubMixerCTR, TransformerCTR, HSTUCTR, build_model,
+    TransformerCTR, HSTUCTR, build_model,
 )
 
 
@@ -516,7 +516,7 @@ def main():
 
     if is_main_process():
         print("=" * 60)
-        arch_names = {"rankmixer": "RankMixer", "tokenmixer_large": "TokenMixer-Large", "submixer": "SubMixer", "hstu": "HSTU", "transformer": "Transformer", "dmin": "DMIN"}
+        arch_names = {"rankmixer": "RankMixer", "tokenmixer_large": "TokenMixer-Large", "hstu": "HSTU", "transformer": "Transformer", "dmin": "DMIN"}
         print(f"{arch_names.get(arch, arch)} on KuaiVideo_x1")
         print(f"Config: {args.config}")
         print(f"Device: {device} | World size: {world_size}")
@@ -618,7 +618,7 @@ def main():
     save_path = os.path.join(save_dir, "best.pt")
 
     # TokenMixer-Large 的辅助损失权重
-    aux_loss_weight = model_cfg.get("aux_loss_weight", 0.1) if arch in ("tokenmixer_large", "submixer") else 0.0
+    aux_loss_weight = model_cfg.get("aux_loss_weight", 0.1) if arch == "tokenmixer_large" else 0.0
 
     # 梯度累积: micro_batch_size = batch_size / accum_steps
     accum_steps = train_cfg.get("gradient_accumulation_steps", 1)
@@ -682,8 +682,8 @@ def main():
                     pos_vis, neg_vis,
                 )
 
-                if arch in ("tokenmixer_large", "submixer"):
-                    # TokenMixer-Large / SubMixer returns (main_logits, aux_logits, emb_reg)
+                if arch == "tokenmixer_large":
+                    # TokenMixer-Large returns (main_logits, aux_logits, emb_reg)
                     main_logits, aux_logits_tm, emb_reg = model_output
                     main_loss = criterion(main_logits, labels)
                     if aux_logits_tm.abs().sum() > 0:
@@ -736,7 +736,7 @@ def main():
                     avg = epoch_loss / epoch_samples
                     elapsed = time.time() - t0
                     speed = epoch_samples / elapsed
-                    aux_name = {"tokenmixer_large": "Aux", "submixer": "Aux", "rankmixer": "Reg", "dmin": "Reg"}.get(arch, "Reg")
+                    aux_name = {"tokenmixer_large": "Aux", "rankmixer": "Reg", "dmin": "Reg"}.get(arch, "Reg")
                     print(
                         f"  Step {optim_step:5d} | "
                         f"Samples: {epoch_samples:>8d} | "
