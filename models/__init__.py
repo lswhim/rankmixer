@@ -18,6 +18,13 @@ from .tokenmixer_large import (
     TokenMixerLarge,
 )
 
+from .submixer import (
+    LatentAdaptiveMixer,
+    SubMixerBlock,
+    SubMixerMoEBlock,
+    SubMixer,
+)
+
 from .hstu import (
     HSTULayer,
     RMSNorm as HSTURMSNorm,
@@ -30,6 +37,7 @@ from .ctr_models import (
     BaseCTR,
     RankMixerCTR,
     TokenMixerLargeCTR,
+    SubMixerCTR,
     TransformerCTR,
     HSTUCTR,
     build_model,

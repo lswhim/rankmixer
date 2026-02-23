@@ -385,6 +385,119 @@ class TokenMixerLargeCTR(BaseCTR):
 # 标准 Multi-Head Self-Attention + FFN, 作为最简对照组
 # ============================================================
 
+class SubMixerCTR(BaseCTR):
+    """
+    SubMixer CTR 模型: Multi-Subspace Adaptive Token Mixing
+    返回格式与 TokenMixerLargeCTR 一致: (main_logits, aux_logits, emb_reg)
+    """
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        from .submixer import SubMixerBlock, SubMixerMoEBlock
+        from .tokenmixer_large import RMSNorm
+
+        model_cfg = cfg["model"]
+        T = self.num_tokens
+        hidden_dim = self.hidden_dim
+        T_global = T + 1
+        self._gradient_checkpointing = False
+
+        num_layers = model_cfg["num_layers"]
+        ffn_expansion = model_cfg["ffn_expansion"]
+        use_moe = model_cfg["use_moe"]
+        small_init = model_cfg.get("small_init", True)
+        d_latent = model_cfg.get("d_latent", 0)
+        num_subspaces = model_cfg.get("num_subspaces", 4)
+        inter_residual_interval = model_cfg.get("inter_residual_interval", 2)
+        self.inter_residual_interval = inter_residual_interval
+        self.num_layers = num_layers
+        self.aux_loss_weight = model_cfg.get("aux_loss_weight", 0.1)
+
+        print(f"  [SubMixer] Feature dim: {self.total_dim}, Tokens (T): {T}, "
+              f"+1 global = {T_global}")
+        print(f"  Hidden (D): {hidden_dim}, D/(T+1): {hidden_dim // T_global}")
+        print(f"  Layers: {num_layers}, MoE: {use_moe}, "
+              f"Subspaces: {num_subspaces}, d_latent: {d_latent if d_latent > 0 else 'auto'}")
+
+        self.global_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        nn.init.normal_(self.global_token, std=0.02)
+
+        if use_moe:
+            num_experts = model_cfg["num_experts"]
+            top_k = model_cfg.get("top_k", 2)
+            gate_scale = model_cfg.get("gate_scale", 0.0)
+            self.blocks = nn.ModuleList([
+                SubMixerMoEBlock(
+                    T_global, hidden_dim, d_latent, num_subspaces,
+                    num_experts, top_k, ffn_expansion, gate_scale, small_init
+                ) for _ in range(num_layers)
+            ])
+        else:
+            self.blocks = nn.ModuleList([
+                SubMixerBlock(
+                    T_global, hidden_dim, d_latent, num_subspaces,
+                    ffn_expansion, small_init
+                ) for _ in range(num_layers)
+            ])
+
+        self.aux_heads = nn.ModuleDict()
+        for i in range(inter_residual_interval - 1, num_layers - 1, inter_residual_interval):
+            self.aux_heads[str(i)] = nn.Sequential(
+                RMSNorm(hidden_dim),
+                nn.Linear(hidden_dim, 1),
+            )
+
+        output_head_units = model_cfg.get("output_head_units", [256])
+        head_layers = [RMSNorm(hidden_dim)]
+        in_dim = hidden_dim
+        for h_dim in output_head_units:
+            head_layers.append(nn.Linear(in_dim, h_dim))
+            head_layers.append(nn.ReLU())
+            in_dim = h_dim
+        head_layers.append(nn.Linear(in_dim, 1))
+        self.output_head = nn.Sequential(*head_layers)
+
+    def enable_gradient_checkpointing(self):
+        self._gradient_checkpointing = True
+
+    def forward(self, user_ids, item_ids, item_vis,
+                pos_items, pos_lens, neg_items, neg_lens,
+                pos_items_vis, neg_items_vis):
+        tokens, u_emb, i_emb = self._tokenize(user_ids, item_ids, item_vis,
+                                pos_items, pos_lens, neg_items, neg_lens,
+                                pos_items_vis, neg_items_vis)
+        B = tokens.size(0)
+
+        global_t = self.global_token.expand(B, -1, -1)
+        x = torch.cat([global_t, tokens], dim=1)
+
+        aux_logits_list = []
+        residual_cache = x
+
+        for i, block in enumerate(self.blocks):
+            if self._gradient_checkpointing and self.training:
+                x = ckpt_fn(block, x, use_reentrant=False)
+            else:
+                x = block(x)
+
+            if (i + 1) % self.inter_residual_interval == 0 and i < self.num_layers - 1:
+                x = x + residual_cache
+                residual_cache = x
+
+                if str(i) in self.aux_heads:
+                    aux_logit = self.aux_heads[str(i)](x[:, 0, :]).squeeze(-1)
+                    aux_logits_list.append(aux_logit)
+
+        main_logits = self.output_head(x[:, 0, :]).squeeze(-1)
+
+        if aux_logits_list and self.training:
+            aux_logits = torch.stack(aux_logits_list, dim=0).mean(dim=0)
+        else:
+            aux_logits = torch.zeros_like(main_logits)
+
+        emb_reg = self._get_embedding_reg_loss(u_emb, i_emb)
+        return main_logits, aux_logits, emb_reg
+
+
 class TransformerCTR(BaseCTR):
     """
     最简单的 Transformer baseline:
@@ -653,6 +766,8 @@ def build_model(cfg) -> nn.Module:
     arch = cfg["model"].get("arch", "rankmixer")
     if arch == "tokenmixer_large":
         return TokenMixerLargeCTR(cfg)
+    elif arch == "submixer":
+        return SubMixerCTR(cfg)
     elif arch == "hstu":
         return HSTUCTR(cfg)
     elif arch == "transformer":
