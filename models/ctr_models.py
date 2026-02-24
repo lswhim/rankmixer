@@ -22,6 +22,20 @@ from .rankmixer import (
     MultiHeadTokenMixing, PerTokenFFN, ReLURouter, PerTokenMoEFFN,
     RankMixerBlock, RankMixerMoEBlock,
 )
+from .dmin import Dice, MLPBlock
+
+
+def _build_output_head(input_dim, hidden_units, activation="Dice", dropout=0.1):
+    """
+    构建 BARS 风格的预测头 MLP (对齐 DIN/DMIN benchmark):
+    [Linear → Dice → Dropout] × N → Linear(1)
+    """
+    return nn.Sequential(
+        MLPBlock(input_dim, hidden_units,
+                 hidden_activation=activation,
+                 dropout_rate=dropout),
+        nn.Linear(hidden_units[-1], 1),
+    )
 
 
 # ============================================================
@@ -205,8 +219,10 @@ class RankMixerCTR(BaseCTR):
         num_experts = model_cfg["num_experts"]
         l1_lambda = model_cfg["l1_lambda"]
 
-        # P3: output_head MLP (可配置, 默认 [256])
-        output_head_units = model_cfg.get("output_head_units", [256])
+        # P3: output_head MLP (BARS 风格: [1024,512,256] + Dice + Dropout)
+        output_head_units = model_cfg.get("output_head_units", [1024, 512, 256])
+        head_activation = model_cfg.get("head_activation", "Dice")
+        head_dropout = model_cfg.get("head_dropout", 0.1)
 
         print(f"  [RankMixer] Feature dim: {self.total_dim}, Tokens (T): {T}, "
               f"Hidden (D): {hidden_dim}, D/T: {hidden_dim // T}")
@@ -221,15 +237,10 @@ class RankMixerCTR(BaseCTR):
             for _ in range(num_moe)
         ])
 
-        # P3: MLP 预测头 (LayerNorm → MLP → Linear(1))
-        head_layers = [nn.LayerNorm(hidden_dim)]
-        in_dim = hidden_dim
-        for h_dim in output_head_units:
-            head_layers.append(nn.Linear(in_dim, h_dim))
-            head_layers.append(nn.ReLU())
-            in_dim = h_dim
-        head_layers.append(nn.Linear(in_dim, 1))
-        self.output_head = nn.Sequential(*head_layers)
+        # P3: BARS 风格预测头 (MLPBlock + Dice + Dropout → Linear(1))
+        self.output_head = _build_output_head(
+            hidden_dim, output_head_units, head_activation, head_dropout
+        )
 
     def enable_gradient_checkpointing(self):
         self._gradient_checkpointing = True
@@ -323,16 +334,13 @@ class TokenMixerLargeCTR(BaseCTR):
                 nn.Linear(hidden_dim, 1),
             )
 
-        # P3: MLP 预测头 (主输出)
-        output_head_units = model_cfg.get("output_head_units", [256])
-        head_layers = [RMSNorm(hidden_dim)]
-        in_dim = hidden_dim
-        for h_dim in output_head_units:
-            head_layers.append(nn.Linear(in_dim, h_dim))
-            head_layers.append(nn.ReLU())
-            in_dim = h_dim
-        head_layers.append(nn.Linear(in_dim, 1))
-        self.output_head = nn.Sequential(*head_layers)
+        # P3: BARS 风格预测头 (主输出)
+        output_head_units = model_cfg.get("output_head_units", [1024, 512, 256])
+        head_activation = model_cfg.get("head_activation", "Dice")
+        head_dropout = model_cfg.get("head_dropout", 0.1)
+        self.output_head = _build_output_head(
+            hidden_dim, output_head_units, head_activation, head_dropout
+        )
 
     def enable_gradient_checkpointing(self):
         self._gradient_checkpointing = True
@@ -405,8 +413,10 @@ class TransformerCTR(BaseCTR):
         ffn_expansion = model_cfg.get("ffn_expansion", 4)
         dropout = model_cfg.get("dropout", 0.0)
 
-        # P3: output_head MLP (可配置, 默认 [256])
-        output_head_units = model_cfg.get("output_head_units", [256])
+        # P3: output_head MLP (BARS 风格)
+        output_head_units = model_cfg.get("output_head_units", [1024, 512, 256])
+        head_activation = model_cfg.get("head_activation", "Dice")
+        head_dropout = model_cfg.get("head_dropout", 0.1)
 
         print(f"  [Transformer] Feature dim: {self.total_dim}, Tokens (T): {T}, "
               f"Hidden (D): {hidden_dim}, Heads: {num_heads}, "
@@ -427,15 +437,10 @@ class TransformerCTR(BaseCTR):
             for _ in range(num_layers)
         ])
 
-        # P3: MLP 预测头
-        head_layers = [nn.LayerNorm(hidden_dim)]
-        in_dim = hidden_dim
-        for h_dim in output_head_units:
-            head_layers.append(nn.Linear(in_dim, h_dim))
-            head_layers.append(nn.ReLU())
-            in_dim = h_dim
-        head_layers.append(nn.Linear(in_dim, 1))
-        self.output_head = nn.Sequential(*head_layers)
+        # P3: BARS 风格预测头
+        self.output_head = _build_output_head(
+            hidden_dim, output_head_units, head_activation, head_dropout
+        )
 
     def enable_gradient_checkpointing(self):
         self._gradient_checkpointing = True
@@ -547,16 +552,13 @@ class HSTUCTR(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # P3: MLP 预测头 (可配置)
-        output_head_units = model_cfg.get("output_head_units", [256])
-        head_layers = [HSTURMSNorm(hidden_dim)]
-        in_dim = hidden_dim
-        for h_dim in output_head_units:
-            head_layers.append(nn.Linear(in_dim, h_dim))
-            head_layers.append(nn.ReLU())
-            in_dim = h_dim
-        head_layers.append(nn.Linear(in_dim, 1))
-        self.output_head = nn.Sequential(*head_layers)
+        # P3: BARS 风格预测头 (可配置)
+        output_head_units = model_cfg.get("output_head_units", [1024, 512, 256])
+        head_activation = model_cfg.get("head_activation", "Dice")
+        head_dropout = model_cfg.get("head_dropout", 0.1)
+        self.output_head = _build_output_head(
+            hidden_dim, output_head_units, head_activation, head_dropout
+        )
 
     def _get_embedding_reg_loss(self, u_emb, i_emb):
         """P0: batch-level embedding L2 正则损失"""

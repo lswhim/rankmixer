@@ -35,7 +35,9 @@ model:
   num_heads: 8                           # H (head_dim = D/H = 32)
   ffn_expansion: 4                       # FFN 扩展倍率
   dropout: 0.0
-  output_head_units: [256]               # P3: 预测头 MLP 隐藏层
+  output_head_units: [1024, 512, 256]    # P3: 预测头 MLP 隐藏层 (对齐 BARS)
+  head_activation: "Dice"                # 对齐 BARS DIN/DMIN
+  head_dropout: 0.1                      # 对齐 BARS DIN/DMIN
 
 # --- 训练配置 ---
 training:
