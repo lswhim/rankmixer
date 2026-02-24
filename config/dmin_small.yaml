@@ -67,7 +67,7 @@ logging:
   save_best: true
 
 # --- 随机种子 ---
-seed: 42
+seed: 20222023                           # 与 BARS benchmark 对齐
 
 # --- 设备配置 ---
 device: "auto"
