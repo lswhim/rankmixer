@@ -56,7 +56,7 @@ training:
   scheduler: "cosine"
   scheduler_eta_min: 1.0e-6
   warmup_steps: 500
-  early_stop_patience: 5
+  early_stop_patience: 2
 
 # --- 日志与评估配置 ---
 logging:

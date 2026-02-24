@@ -55,7 +55,7 @@ training:
   warmup_steps: 1000
   gradient_accumulation_steps: 8
   gradient_checkpointing: true
-  early_stop_patience: 5
+  early_stop_patience: 2
 
 # --- 日志与评估配置 ---
 logging:
