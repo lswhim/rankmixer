@@ -34,9 +34,9 @@ model:
   num_layers: 4                          # L=4
   ffn_expansion: 4                       # n
   use_moe: true                          # MoE 版本
-  num_experts: 8                         # E=8
-  top_k: 2                              # top-k routing
-  gate_scale: 0.0                        # auto: α = E/k = 4
+  num_experts: 4                         # E=4
+  top_k: 2                              # top-k routing (稀疏比 1:2)
+  gate_scale: 0.0                        # auto: α = E/k = 2
   small_init: true                       # Down-matrix small init
   inter_residual_interval: 2             # 每 2 层一次跨层残差
   aux_loss_weight: 0.1                   # 辅助损失权重 λ
