@@ -1,0 +1,75 @@
+# ============================================================
+# HiFormer-Small on KuaiVideo_x1
+# 论文: "Hiformer: Heterogeneous Feature Interactions Learning
+#        with Transformers for Recommender Systems" (Google, arXiv:2311.05884)
+#
+# HiFormer 核心: 异质自注意力层 (Heterogeneous Self-Attention)
+# - Q/K 通过不同变换 φ() 和 ψ() 处理后再计算注意力
+# - 使用 Depthwise Conv + MLP 实现异质性变换
+# - 捕捉不同类型特征之间的非对称交互
+# ============================================================
+
+# --- 数据配置 ---
+data:
+  use_pretrained_emb: true
+  data_dir: "KuaiVideo_x1"
+  train_file: "train.csv"
+  test_file: "test.csv"
+  item_emb_file: "item_visual_emb_dim64.h5"
+  num_users: 10000
+  num_items: 3242316
+  item_hash_size: 3250000
+  item_vis_dim: 64
+  max_seq_len: 100
+  embedding_regularizer: 1.0e-4
+
+# --- 特征 Embedding 配置 ---
+embedding:
+  user_emb_dim: 64
+  item_emb_dim: 64
+
+# --- HiFormer 模型配置 ---
+model:
+  arch: "hiformer"
+  chunk_size: 20                         # Token 化 chunk 大小
+  hidden_dim: 256                         # D
+  num_layers: 4                           # L
+  num_heads: 8                             # H (head_dim = D/H = 32)
+  ffn_expansion: 4                        # FFN 扩展倍率
+  dropout: 0.0
+  transform_type: "dwconv_mlp"            # 异质变换类型: dwconv_mlp 或 gate_mlp
+  output_head_units: [1024, 512, 256]     # P3: 预测头 MLP 隐藏层 (对齐 BARS)
+  head_activation: "Dice"                 # 对齐 BARS DIN/DMIN
+  head_dropout: 0.1                       # 对齐 BARS DIN/DMIN
+
+# --- 训练配置 ---
+training:
+  batch_size: 2048
+  learning_rate: 5.0e-4
+  weight_decay: 0.0
+  num_epochs: 100
+  grad_clip_norm: 1.0
+  optimizer: "adam"
+  scheduler: "reduce_lr_on_plateau"
+  reduce_lr_on_plateau: true
+  lr_decay_factor: 0.1
+  scheduler_eta_min: 1.0e-6
+  early_stop_patience: 2
+
+# --- 日志与评估配置 ---
+logging:
+  log_interval: 200
+  eval_samples: 0
+  save_path: "hiformer_small_kuaivideo.pt"
+  save_best: true
+
+# --- 随机种子 ---
+seed: 42
+
+# --- 设备配置 ---
+device: "auto"
+
+# --- wandb 配置 ---
+wandb:
+  project: "rankmixer"
+  tags: ["hiformer", "small"]

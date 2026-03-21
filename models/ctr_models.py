@@ -648,6 +648,90 @@ class HSTUCTR(nn.Module):
 
 
 # ============================================================
+# HiFormer CTR 模型 (arXiv:2311.05884)
+# 异质自注意力: 通过 φ(Q) 和 ψ(K) 不同变换捕捉异质性特征交互
+# ============================================================
+
+class HiFormerCTR(BaseCTR):
+    """
+    HiFormer CTR 模型
+
+    核心创新: 异质自注意力层 (Heterogeneous Self-Attention)
+    - Q/K 通过不同的变换 φ() 和 ψ() 处理
+    - 使用 Depthwise Conv + MLP 实现异质性变换
+    - 允许捕捉不同类型特征之间的非对称交互
+
+    架构:
+    - 继承 BaseCTR: 复用 embedding + DIN 序列编码 + chunk tokenization
+    - L 层 HiFormerLayer (异质自注意力 + FFN)
+    - Mean pooling → MLP 预测头
+    """
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        from .hiformer import HiFormerLayer
+
+        model_cfg = cfg["model"]
+        T = self.num_tokens
+        hidden_dim = self.hidden_dim
+        self._gradient_checkpointing = False
+
+        num_layers = model_cfg["num_layers"]
+        num_heads = model_cfg["num_heads"]
+        ffn_expansion = model_cfg.get("ffn_expansion", 4)
+        dropout = model_cfg.get("dropout", 0.0)
+        transform_type = model_cfg.get("transform_type", "dwconv_mlp")
+
+        # P3: output_head MLP (BARS 风格)
+        output_head_units = model_cfg.get("output_head_units", [1024, 512, 256])
+        head_activation = model_cfg.get("head_activation", "Dice")
+        head_dropout = model_cfg.get("head_dropout", 0.1)
+
+        print(f"  [HiFormer] Feature dim: {self.total_dim}, Tokens (T): {T}, "
+              f"Hidden (D): {hidden_dim}, Heads: {num_heads}, "
+              f"Head dim: {hidden_dim // num_heads}")
+        print(f"  Layers: {num_layers}, FFN expansion: {ffn_expansion}, "
+              f"Dropout: {dropout}, Transform: {transform_type}")
+
+        self.layers = nn.ModuleList([
+            HiFormerLayer(
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                ffn_expansion=ffn_expansion,
+                dropout=dropout,
+                transform_type=transform_type,
+            )
+            for _ in range(num_layers)
+        ])
+
+        # P3: BARS 风格预测头
+        self.output_head = _build_output_head(
+            hidden_dim, output_head_units, head_activation, head_dropout
+        )
+
+    def enable_gradient_checkpointing(self):
+        self._gradient_checkpointing = True
+
+    def forward(self, user_ids, item_ids, item_vis,
+                pos_items, pos_lens, neg_items, neg_lens,
+                pos_items_vis, neg_items_vis):
+        x, u_emb, i_emb = self._tokenize(user_ids, item_ids, item_vis,
+                           pos_items, pos_lens, neg_items, neg_lens,
+                           pos_items_vis, neg_items_vis)
+
+        for layer in self.layers:
+            if self._gradient_checkpointing and self.training:
+                x = ckpt_fn(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
+
+        x = x.mean(dim=1)
+        logits = self.output_head(x).squeeze(-1)
+        reg_loss = self._get_embedding_reg_loss(u_emb, i_emb)
+        return logits, reg_loss
+
+
+# ============================================================
 # 构建模型 (统一入口)
 # ============================================================
 
@@ -659,6 +743,8 @@ def build_model(cfg) -> nn.Module:
         return HSTUCTR(cfg)
     elif arch == "transformer":
         return TransformerCTR(cfg)
+    elif arch == "hiformer":
+        return HiFormerCTR(cfg)
     elif arch == "dmin":
         from .dmin import DMINCTR
         return DMINCTR(cfg)

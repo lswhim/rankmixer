@@ -25,6 +25,13 @@ from .hstu import (
     HSTU,
 )
 
+from .hiformer import (
+    RMSNorm as HiFormerRMSNorm,
+    HeterogeneousSelfAttention,
+    HiFormerLayer,
+    HiFormer,
+)
+
 from .ctr_models import (
     DINAttention,
     BaseCTR,
@@ -32,5 +39,6 @@ from .ctr_models import (
     TokenMixerLargeCTR,
     TransformerCTR,
     HSTUCTR,
+    HiFormerCTR,
     build_model,
 )
