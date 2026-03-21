@@ -6,3 +6,6 @@ KuaiVideo_x1/
 KuaiVideo_x1 2/
 *.h5
 *.pt
+
+wandb/
+KuaiVideo_x1.zip
