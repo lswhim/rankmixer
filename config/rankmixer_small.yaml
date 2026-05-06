@@ -32,13 +32,14 @@ embedding:
 # 论文 RankMixer-100M: 全 Dense 架构, L=2
 model:
   arch: "rankmixer"
+  mode: "dense"                          # "dense" 或 "moe" 二选一
   chunk_size: 20                         # d → T = ceil(320/20) = 16
   hidden_dim: 768                        # D
-  num_dense_layers: 2                    # L=2 (全 Dense)
-  num_moe_layers: 0                      # 无 MoE
+  num_layers: 2                          # L=2
   ffn_expansion: 4                       # k
-  num_experts: 8                         # (不生效)
-  l1_lambda: 0.01                        # (不生效)
+  # mode=moe 时才需要:
+  #   num_experts: 8
+  #   l1_lambda: 0.01
   din_hidden_units: [256, 128]           # P1: DIN attention MLP 隐藏层
   output_head_units: [1024, 512, 256]    # P3: 预测头 MLP 隐藏层 (对齐 BARS)
   head_activation: "Dice"                # 对齐 BARS DIN/DMIN

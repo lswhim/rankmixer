@@ -9,6 +9,37 @@ RankMixer: Scaling Up Ranking Models in Industrial Recommenders
 4. Sparse-MoE 扩展: ReLU routing + Dense-Train/Sparse-Infer (DTSI)
 """
 
+
+# 1. 特征 Token 化 (FeatureTokenizer)
+# 各特征域（user/item/context 等）通过独立 nn.Embedding 得到向量
+# 拼接所有 embedding → [batch, total_embed_dim]
+# 按固定维度 d 切分成 T 个 token → [batch, T, d]（不足则 padding）
+# 每个片段通过 nn.Linear(d, D) 投影到隐藏维度 → [batch, T, D]
+#
+# 2. RankMixer Blocks (× L 层, mode 二选一)
+# 配置 mode="dense" 或 "moe"，整个模型使用同一种 Block 串行堆叠 L 层。
+# 每个 Block 包含两个子结构，各带残差 + LayerNorm：
+#
+# a) Multi-head Token Mixing（无参数）
+#
+# 将 [batch, T, D] reshape 为 [batch, T, T, D/T]（每个 token 切成 T 个头）
+# transpose(1,2) 实现跨 token 拼接 — 本质是按头维度重排，让每个新 token 包含所有旧 token 的对应头
+# 输出维度不变 [batch, T, D]，替代 Self-Attention，零参数
+#
+# b) Per-token FFN（mode=dense）或 Per-token Sparse MoE FFN（mode=moe）
+#
+# - Dense: 每个 token 有独立的 W1[D, kD]、W2[kD, D]（不共享）
+# - MoE: 每个 token 有 E 个独立专家 + ReLU routing + DTSI (Dense-Train / Sparse-Infer)
+#        * 训练时 router_train 密集路由 (所有专家收梯度)，同时训练 router_infer
+#        * 推理时仅用 router_infer 稀疏路由
+#        * L1 正则 L_reg = λ * Σ G_{i,j} 控制稀疏性
+#
+# 3. 输出层
+# 所有 token 平均池化 → [batch, D]
+# LayerNorm → Linear(D, num_classes) → logits
+
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -53,6 +84,8 @@ class FeatureTokenizer(nn.Module):
         total_embed_dim = sum(embed_dims)
 
         # 拼接后的总维度，需要 padding 到 chunk_size 的整数倍
+
+        # ceil 向上取整
         self.num_tokens = math.ceil(total_embed_dim / chunk_size)  # T
         self.padded_dim = self.num_tokens * chunk_size
 
@@ -80,12 +113,20 @@ class FeatureTokenizer(nn.Module):
         if e_input.size(-1) < self.padded_dim:
             pad_size = self.padded_dim - e_input.size(-1)
             e_input = F.pad(e_input, (0, pad_size))
+        # 552 / 64 = 8.625 → ceil = 9 → padded_dim = 9 × 64 = 576
+        # 552 < 576，需要补零: pad_size = 576 - 552 = 24
+
+        # e_input: [batch, 552] → F.pad → [batch, 576]
+        #                                     ↑ 末尾补了 24 个 0
+
+
+
 
         # 4. 切分: [batch, T, chunk_size]
         batch_size = e_input.size(0)
         tokens = e_input.view(batch_size, self.num_tokens, self.chunk_size)
 
-        # 5. 投影: [batch, T, D]
+        # 5. 投影: [batch, T, D] 64 ——> 256
         tokens = self.proj(tokens)
 
         return tokens
@@ -182,7 +223,9 @@ class PerTokenFFN(nn.Module):
         self.W2 = nn.Parameter(torch.empty(num_tokens, self.kD, hidden_dim))
         self.b2 = nn.Parameter(torch.zeros(num_tokens, hidden_dim))
 
-        # 初始化
+        # 初始化 Kaiming uniform 初始化（He 初始化）
+        # 从均匀分布 U(-bound, bound) 中采样，bound = sqrt(5 / fan_in)
+
         for i in range(num_tokens):
             nn.init.kaiming_uniform_(self.W1[i], a=math.sqrt(5))
             nn.init.kaiming_uniform_(self.W2[i], a=math.sqrt(5))
@@ -448,14 +491,18 @@ class RankMixer(nn.Module):
         embed_dims: List[int],       # 各特征域 embedding dim
         chunk_size: int = 64,        # 切分维度 d
         hidden_dim: int = 256,       # 隐藏维度 D
-        num_dense_layers: int = 3,   # 密集 Block 层数
-        num_moe_layers: int = 1,     # MoE Block 层数
+        mode: str = "dense",         # "dense" 或 "moe" (二选一)
+        num_layers: int = 3,         # Block 层数 L
         ffn_expansion: int = 4,      # FFN 扩展倍率 k
-        num_experts: int = 8,        # 专家数 (MoE)
-        l1_lambda: float = 0.01,     # L1 正则系数
+        num_experts: int = 8,        # 专家数 (仅 mode=moe 生效)
+        l1_lambda: float = 0.01,     # L1 正则系数 (仅 mode=moe 生效)
         num_classes: int = 1,        # 输出数 (CTR=1)
     ):
         super().__init__()
+
+        assert mode in ("dense", "moe"), \
+            f"mode must be 'dense' or 'moe', got '{mode}'"
+        self.mode = mode
 
         # 输入 Token 化
         self.tokenizer = FeatureTokenizer(
@@ -463,17 +510,17 @@ class RankMixer(nn.Module):
         )
         T = self.tokenizer.T  # token 数量
 
-        # 密集 RankMixer Blocks
-        self.dense_blocks = nn.ModuleList([
-            RankMixerBlock(T, hidden_dim, ffn_expansion)
-            for _ in range(num_dense_layers)
-        ])
-
-        # MoE RankMixer Blocks
-        self.moe_blocks = nn.ModuleList([
-            RankMixerMoEBlock(T, hidden_dim, num_experts, ffn_expansion, l1_lambda)
-            for _ in range(num_moe_layers)
-        ])
+        # 二选一: Dense Blocks 或 MoE Blocks
+        if mode == "dense":
+            self.blocks = nn.ModuleList([
+                RankMixerBlock(T, hidden_dim, ffn_expansion)
+                for _ in range(num_layers)
+            ])
+        else:  # mode == "moe"
+            self.blocks = nn.ModuleList([
+                RankMixerMoEBlock(T, hidden_dim, num_experts, ffn_expansion, l1_lambda)
+                for _ in range(num_layers)
+            ])
 
         # Output Pooling → 预测
         self.output = nn.Sequential(
@@ -494,15 +541,15 @@ class RankMixer(nn.Module):
         # Token 化: [batch, T, D]
         x = self.tokenizer(feature_ids)
 
-        # 密集层
-        for block in self.dense_blocks:
-            x = block(x)
-
-        # MoE 层
-        total_reg_loss = 0
-        for block in self.moe_blocks:
-            x, reg_loss = block(x)
-            total_reg_loss = total_reg_loss + reg_loss
+        # 统一串行堆叠 (mode=dense: 全 Dense Block; mode=moe: 全 MoE Block)
+        total_reg_loss = torch.tensor(0.0, device=x.device)
+        if self.mode == "dense":
+            for block in self.blocks:
+                x = block(x)
+        else:  # moe
+            for block in self.blocks:
+                x, reg_loss = block(x)
+                total_reg_loss = total_reg_loss + reg_loss
 
         # 输出: 平均池化 → 线性
         x = x.mean(dim=1)  # [batch, D]
@@ -539,10 +586,10 @@ def test():
         embed_dims=embed_dims,
         chunk_size=70,       # d: 切分维度 (ceil(552/70)=8)
         hidden_dim=256,      # D: 隐藏维度 (必须被 T=8 整除, 256/8=32)
-        num_dense_layers=3,  # L_dense
-        num_moe_layers=1,    # L_moe
+        mode="moe",          # "dense" 或 "moe" 二选一
+        num_layers=4,        # L
         ffn_expansion=4,     # k
-        num_experts=4,       # E
+        num_experts=4,       # E (仅 moe 模式生效)
         l1_lambda=0.01,
         num_classes=1,
     )
@@ -569,14 +616,12 @@ def test():
     # 参数统计
     total = sum(p.numel() for p in model.parameters())
     tokenizer_params = sum(p.numel() for p in model.tokenizer.parameters())
-    dense_params = sum(p.numel() for p in model.dense_blocks.parameters())
-    moe_params = sum(p.numel() for p in model.moe_blocks.parameters())
+    block_params = sum(p.numel() for p in model.blocks.parameters())
     output_params = sum(p.numel() for p in model.output.parameters())
 
     print(f"总参数量:        {total / 1e6:.2f}M")
     print(f"  Tokenizer:     {tokenizer_params / 1e6:.2f}M")
-    print(f"  Dense blocks:  {dense_params / 1e6:.2f}M")
-    print(f"  MoE blocks:    {moe_params / 1e6:.2f}M")
+    print(f"  Blocks ({model.mode}): {block_params / 1e6:.2f}M")
     print(f"  Output:        {output_params / 1e6:.2f}M")
 
     # 论文公式验证: #Param ≈ 2kLTD^2

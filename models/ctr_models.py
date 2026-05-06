@@ -213,11 +213,12 @@ class RankMixerCTR(BaseCTR):
         hidden_dim = self.hidden_dim
         self._gradient_checkpointing = False
 
-        num_dense = model_cfg["num_dense_layers"]
-        num_moe = model_cfg["num_moe_layers"]
+        # mode 二选一: "dense" 或 "moe"
+        mode = model_cfg.get("mode", "dense").lower()
+        assert mode in ("dense", "moe"), \
+            f"RankMixer model.mode must be 'dense' or 'moe', got '{mode}'"
+        num_layers = model_cfg["num_layers"]
         ffn_exp = model_cfg["ffn_expansion"]
-        num_experts = model_cfg["num_experts"]
-        l1_lambda = model_cfg["l1_lambda"]
 
         # P3: output_head MLP (BARS 风格: [1024,512,256] + Dice + Dropout)
         output_head_units = model_cfg.get("output_head_units", [1024, 512, 256])
@@ -226,16 +227,22 @@ class RankMixerCTR(BaseCTR):
 
         print(f"  [RankMixer] Feature dim: {self.total_dim}, Tokens (T): {T}, "
               f"Hidden (D): {hidden_dim}, D/T: {hidden_dim // T}")
-        print(f"  Dense layers: {num_dense}, MoE layers: {num_moe}, "
-              f"Experts: {num_experts}, FFN expansion: {ffn_exp}")
 
-        self.dense_blocks = nn.ModuleList([
-            RankMixerBlock(T, hidden_dim, ffn_exp) for _ in range(num_dense)
-        ])
-        self.moe_blocks = nn.ModuleList([
-            RankMixerMoEBlock(T, hidden_dim, num_experts, ffn_exp, l1_lambda)
-            for _ in range(num_moe)
-        ])
+        self.mode = mode
+        if mode == "dense":
+            print(f"  Mode: dense, Layers: {num_layers}, FFN expansion: {ffn_exp}")
+            self.blocks = nn.ModuleList([
+                RankMixerBlock(T, hidden_dim, ffn_exp) for _ in range(num_layers)
+            ])
+        else:  # moe
+            num_experts = model_cfg["num_experts"]
+            l1_lambda = model_cfg["l1_lambda"]
+            print(f"  Mode: moe, Layers: {num_layers}, Experts: {num_experts}, "
+                  f"FFN expansion: {ffn_exp}, L1 λ: {l1_lambda}")
+            self.blocks = nn.ModuleList([
+                RankMixerMoEBlock(T, hidden_dim, num_experts, ffn_exp, l1_lambda)
+                for _ in range(num_layers)
+            ])
 
         # P3: BARS 风格预测头 (MLPBlock + Dice + Dropout → Linear(1))
         self.output_head = _build_output_head(
@@ -252,19 +259,20 @@ class RankMixerCTR(BaseCTR):
                            pos_items, pos_lens, neg_items, neg_lens,
                            pos_items_vis, neg_items_vis)
 
-        for blk in self.dense_blocks:
-            if self._gradient_checkpointing and self.training:
-                x = ckpt_fn(blk, x, use_reentrant=False)
-            else:
-                x = blk(x)
-
         total_reg = torch.tensor(0.0, device=x.device)
-        for blk in self.moe_blocks:
-            if self._gradient_checkpointing and self.training:
-                x, reg = ckpt_fn(blk, x, use_reentrant=False)
-            else:
-                x, reg = blk(x)
-            total_reg = total_reg + reg
+        if self.mode == "dense":
+            for blk in self.blocks:
+                if self._gradient_checkpointing and self.training:
+                    x = ckpt_fn(blk, x, use_reentrant=False)
+                else:
+                    x = blk(x)
+        else:  # moe
+            for blk in self.blocks:
+                if self._gradient_checkpointing and self.training:
+                    x, reg = ckpt_fn(blk, x, use_reentrant=False)
+                else:
+                    x, reg = blk(x)
+                total_reg = total_reg + reg
 
         # P0: batch-level embedding L2 正则
         total_reg = total_reg + self._get_embedding_reg_loss(u_emb, i_emb)

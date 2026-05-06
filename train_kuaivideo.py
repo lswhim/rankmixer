@@ -551,13 +551,17 @@ def main():
         T = model.num_tokens
         D = model_cfg["hidden_dim"]
         k = model_cfg["ffn_expansion"]
-        L_dense = model_cfg["num_dense_layers"]
-        L_moe = model_cfg["num_moe_layers"]
-        E = model_cfg["num_experts"]
-        dense_theory = 2 * k * L_dense * T * D * D
-        moe_theory = 2 * k * L_moe * T * D * D * E
-        print(f"  论文理论 Dense 参数量 (2kL_dTD²): {dense_theory / 1e6:.2f}M")
-        print(f"  论文理论 MoE 参数量 (2kL_mTD²E): {moe_theory / 1e6:.2f}M")
+        L = model_cfg["num_layers"]
+        mode = model_cfg.get("mode", "dense").lower()
+        if mode == "dense":
+            theory = 2 * k * L * T * D * D
+            print(f"  论文理论 Dense 参数量 (2kLTD²): {theory / 1e6:.2f}M  "
+                  f"[mode=dense, L={L}, T={T}, D={D}, k={k}]")
+        else:
+            E = model_cfg["num_experts"]
+            theory = 2 * k * L * T * D * D * E
+            print(f"  论文理论 MoE 参数量 (2kLTD²·E): {theory / 1e6:.2f}M  "
+                  f"[mode=moe, L={L}, T={T}, D={D}, k={k}, E={E}]")
 
     # --- DDP 包装 ---
     if is_dist():
