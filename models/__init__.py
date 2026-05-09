@@ -32,6 +32,14 @@ from .hiformer import (
     HiFormer,
 )
 
+from .hyformer import (
+    RMSNorm as HyFormerRMSNorm,
+    QueryGenerator,
+    QueryDecoding,
+    QueryBoosting,
+    HyFormerBlock,
+)
+
 from .ctr_models import (
     DINAttention,
     BaseCTR,
@@ -40,5 +48,6 @@ from .ctr_models import (
     TransformerCTR,
     HSTUCTR,
     HiFormerCTR,
+    HyFormerCTR,
     build_model,
 )

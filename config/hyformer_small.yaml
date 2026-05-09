@@ -1,0 +1,69 @@
+# ============================================================
+# HyFormer-Small on KuaiVideo_x1
+# Paper: "HyFormer: Revisiting the Roles of Sequence Modeling
+#         and Feature Interaction in CTR Prediction"
+#         ByteDance, arXiv:2601.12681
+#
+# Core: Query Decoding over behavior sequence + RankMixer-style
+# Query Boosting over global query tokens and non-sequential tokens.
+# chunk_size=20 -> NS tokens = ceil((64+64+64)/20)=10
+# num_query_tokens=6 -> boosting tokens = 16, so D must be divisible by 16.
+# ============================================================
+
+data:
+  use_pretrained_emb: true
+  data_dir: "KuaiVideo_x1"
+  train_file: "train.csv"
+  test_file: "test.csv"
+  item_emb_file: "item_visual_emb_dim64.h5"
+  num_users: 10000
+  num_items: 3242316
+  item_hash_size: 3250000
+  item_vis_dim: 64
+  max_seq_len: 100
+  embedding_regularizer: 1.0e-4
+
+embedding:
+  user_emb_dim: 64
+  item_emb_dim: 64
+
+model:
+  arch: "hyformer"
+  chunk_size: 20
+  hidden_dim: 768
+  num_layers: 2
+  num_heads: 12
+  num_query_tokens: 6
+  ffn_expansion: 4
+  seq_ffn_expansion: 2
+  dropout: 0.0
+  din_hidden_units: [256, 128]
+  output_head_units: [1024, 512, 256]
+  head_activation: "Dice"
+  head_dropout: 0.1
+
+training:
+  batch_size: 2048
+  learning_rate: 5.0e-4
+  weight_decay: 0.0
+  num_epochs: 100
+  grad_clip_norm: 10.0
+  optimizer: "adam"
+  scheduler: "reduce_lr_on_plateau"
+  reduce_lr_on_plateau: true
+  lr_decay_factor: 0.1
+  scheduler_eta_min: 1.0e-6
+  early_stop_patience: 2
+
+logging:
+  log_interval: 200
+  eval_samples: 0
+  save_path: "hyformer_small_kuaivideo.pt"
+  save_best: true
+
+seed: 42
+device: "auto"
+
+wandb:
+  project: "rankmixer"
+  tags: ["hyformer", "small"]

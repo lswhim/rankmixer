@@ -3,6 +3,7 @@
 Unofficial implementation of:
 - **RankMixer: Scaling Up Ranking Models in Industrial Recommenders** (ByteDance, [arXiv:2507.15551](https://arxiv.org/abs/2507.15551))
 - **TokenMixer-Large: Scaling Up Large Ranking Models in Industrial Recommenders** (ByteDance, [arXiv:2602.06563](https://arxiv.org/abs/2602.06563))
+- **HyFormer: Revisiting the Roles of Sequence Modeling and Feature Interaction in CTR Prediction** (ByteDance, [arXiv:2601.12681](https://arxiv.org/abs/2601.12681))
 - **Actions Speak Louder than Words: Trillion-Parameter Sequential Transducers for Generative Recommendations** (Meta, [arXiv:2402.17152](https://arxiv.org/abs/2402.17152))
 - **Vanilla Transformer** — Standard Pre-LN Transformer baseline for comparison
 
@@ -56,6 +57,24 @@ Input Features → Chunking (d) → T Tokens → Proj(D)
                               └───────────────────┘
                                       ↓
                               Mean Pooling → Output
+```
+
+### HyFormer (ByteDance)
+
+```
+Non-seq Features → NS Tokens ┐
+                             ├─ Query Generation → Global Query Tokens
+Behavior Sequence → Seq K/V ┘
+                                      ↓
+                            ┌──────────────────────────┐
+                            │ HyFormer Block            │ × L
+                            │  ├─ Query Decoding        │
+                            │  │  CrossAttn(Q, Seq K/V) │
+                            │  └─ Query Boosting        │
+                            │     RankMixer-style mix   │
+                            └──────────────────────────┘
+                                      ↓
+                                Query Pooling → Output
 ```
 
 ### Vanilla Transformer (Baseline)
@@ -151,7 +170,20 @@ python train_kuaivideo.py --config config/tokenmixer_small.yaml
 python train_kuaivideo.py --config config/tokenmixer_middle.yaml
 ```
 
-### 4. Train HSTU
+### 4. Train HyFormer
+
+```bash
+# Small (Query Decoding + Query Boosting)
+python train_kuaivideo.py --config config/hyformer_small.yaml
+
+# Middle
+python train_kuaivideo.py --config config/hyformer_middle.yaml
+
+# Large
+python train_kuaivideo.py --config config/hyformer_large.yaml
+```
+
+### 5. Train HSTU
 
 ```bash
 # Small (L=4, H=8, ~36M)
@@ -164,7 +196,7 @@ python train_kuaivideo.py --config config/hstu_middle.yaml
 python train_kuaivideo.py --config config/hstu_large.yaml
 ```
 
-### 5. Train Vanilla Transformer
+### 6. Train Vanilla Transformer
 
 ```bash
 # Small (L=4, H=16, ~61M)
@@ -193,6 +225,14 @@ python train_kuaivideo.py --config config/transformer_large.yaml
 |--------|-----|---|---|----------|---|-------|
 | `tokenmixer_small.yaml` | 17 | 544 | 4 | Dense pSwiGLU | — | — |
 | `tokenmixer_middle.yaml` | 17 | 544 | 4 | Sparse-Pertoken MoE | 8 | 2 |
+
+### HyFormer
+
+| Config | NS+Q Tokens | D | L | Heads | Paper Mechanism |
+|--------|-------------|---|---|-------|-----------------|
+| `hyformer_small.yaml` | 16 | 768 | 2 | 12 | Query Decoding + Query Boosting |
+| `hyformer_middle.yaml` | 16 | 1024 | 4 | 16 | Query Decoding + Query Boosting |
+| `hyformer_large.yaml` | 32 | 1536 | 4 | 24 | Query Decoding + Query Boosting |
 
 ### HSTU
 

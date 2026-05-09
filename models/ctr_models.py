@@ -740,6 +740,141 @@ class HiFormerCTR(BaseCTR):
 
 
 # ============================================================
+# HyFormer CTR 模型 (ByteDance, arXiv:2601.12681)
+# Query Decoding + Query Boosting
+# ============================================================
+
+class HyFormerCTR(BaseCTR):
+    """
+    ByteDance HyFormer adapted to the KuaiVideo CTR pipeline.
+
+    It keeps non-sequential features as tokens, keeps the positive behavior
+    sequence as sequence tokens, and alternates:
+    - Query Decoding: global query tokens cross-attend to sequence K/V.
+    - Query Boosting: RankMixer-style mixing over queries and NS tokens.
+    """
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        from .hyformer import HyFormerBlock, QueryGenerator
+
+        data_cfg = cfg["data"]
+        emb_cfg = cfg["embedding"]
+        model_cfg = cfg["model"]
+
+        hidden_dim = self.hidden_dim
+        chunk_size = self.chunk_size
+        user_emb_dim = emb_cfg["user_emb_dim"]
+        item_emb_dim = emb_cfg["item_emb_dim"]
+        item_vis_dim = data_cfg["item_vis_dim"] if self.use_pretrained else 0
+        seq_input_dim = item_emb_dim + item_vis_dim
+
+        self._gradient_checkpointing = False
+        self.num_query_tokens = model_cfg.get("num_query_tokens", 6)
+        self.nonseq_dim = user_emb_dim + item_emb_dim + item_vis_dim
+        self.num_nonseq_tokens = math.ceil(self.nonseq_dim / chunk_size)
+        self.nonseq_padded_dim = self.num_nonseq_tokens * chunk_size
+
+        num_layers = model_cfg["num_layers"]
+        num_heads = model_cfg["num_heads"]
+        ffn_expansion = model_cfg.get("ffn_expansion", 4)
+        seq_ffn_expansion = model_cfg.get("seq_ffn_expansion", 2)
+        dropout = model_cfg.get("dropout", 0.0)
+
+        # Reuse BaseCTR.proj for non-sequential chunk projection.
+        self.seq_proj = nn.Linear(seq_input_dim, hidden_dim)
+        self.query_generator = QueryGenerator(
+            self.num_nonseq_tokens,
+            self.num_query_tokens,
+            hidden_dim,
+            dropout=dropout,
+        )
+        self.blocks = nn.ModuleList([
+            HyFormerBlock(
+                num_query_tokens=self.num_query_tokens,
+                num_nonseq_tokens=self.num_nonseq_tokens,
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                ffn_expansion=ffn_expansion,
+                seq_ffn_expansion=seq_ffn_expansion,
+                dropout=dropout,
+            )
+            for _ in range(num_layers)
+        ])
+
+        output_head_units = model_cfg.get("output_head_units", [1024, 512, 256])
+        head_activation = model_cfg.get("head_activation", "Dice")
+        head_dropout = model_cfg.get("head_dropout", 0.1)
+        self.output_head = _build_output_head(
+            hidden_dim, output_head_units, head_activation, head_dropout
+        )
+
+        boost_tokens = self.num_query_tokens + self.num_nonseq_tokens
+        print(f"  [HyFormer] NS dim: {self.nonseq_dim}, NS tokens: {self.num_nonseq_tokens}, "
+              f"Query tokens: {self.num_query_tokens}, Boost tokens: {boost_tokens}")
+        print(f"  Hidden (D): {hidden_dim}, Heads: {num_heads}, Layers: {num_layers}, "
+              f"FFN expansion: {ffn_expansion}, Seq FFN expansion: {seq_ffn_expansion}")
+
+    def enable_gradient_checkpointing(self):
+        self._gradient_checkpointing = True
+
+    def _tokenize_nonseq_and_seq(self, user_ids, item_ids, item_vis,
+                                 pos_items, pos_lens, pos_items_vis):
+        u_emb = self.user_emb(user_ids)
+        i_emb = self.item_emb(item_ids)
+
+        if self.use_pretrained:
+            item_vis_proj = self.vis_proj(item_vis)
+            pos_id_emb = self.item_emb(pos_items)
+            pos_vis_proj = self.vis_proj(pos_items_vis)
+            seq_raw = torch.cat([pos_id_emb, pos_vis_proj], dim=-1)
+            nonseq_input = torch.cat([u_emb, i_emb, item_vis_proj], dim=-1)
+        else:
+            seq_raw = self.item_emb(pos_items)
+            nonseq_input = torch.cat([u_emb, i_emb], dim=-1)
+
+        B = nonseq_input.size(0)
+        if nonseq_input.size(-1) < self.nonseq_padded_dim:
+            nonseq_input = F.pad(
+                nonseq_input,
+                (0, self.nonseq_padded_dim - nonseq_input.size(-1)),
+            )
+        nonseq_chunks = nonseq_input.view(B, self.num_nonseq_tokens, self.chunk_size)
+        nonseq_tokens = self.proj(nonseq_chunks)
+
+        seq_mask = (
+            torch.arange(pos_items.size(1), device=pos_items.device).unsqueeze(0)
+            < pos_lens.unsqueeze(1)
+        )
+        seq_tokens = self.seq_proj(seq_raw)
+        seq_tokens = seq_tokens * seq_mask.unsqueeze(-1).to(seq_tokens.dtype)
+        return nonseq_tokens, seq_tokens, seq_mask, u_emb, i_emb
+
+    def forward(self, user_ids, item_ids, item_vis,
+                pos_items, pos_lens, neg_items, neg_lens,
+                pos_items_vis, neg_items_vis):
+        nonseq_tokens, seq_tokens, seq_mask, u_emb, i_emb = self._tokenize_nonseq_and_seq(
+            user_ids, item_ids, item_vis, pos_items, pos_lens, pos_items_vis
+        )
+
+        queries = self.query_generator(nonseq_tokens, seq_tokens, seq_mask)
+        for block in self.blocks:
+            if self._gradient_checkpointing and self.training:
+                queries, nonseq_tokens, seq_tokens = ckpt_fn(
+                    block, queries, nonseq_tokens, seq_tokens, seq_mask,
+                    use_reentrant=False,
+                )
+            else:
+                queries, nonseq_tokens, seq_tokens = block(
+                    queries, nonseq_tokens, seq_tokens, seq_mask
+                )
+
+        logits = self.output_head(queries.mean(dim=1)).squeeze(-1)
+        reg_loss = self._get_embedding_reg_loss(u_emb, i_emb)
+        return logits, reg_loss
+
+
+# ============================================================
 # 构建模型 (统一入口)
 # ============================================================
 
@@ -753,6 +888,8 @@ def build_model(cfg) -> nn.Module:
         return TransformerCTR(cfg)
     elif arch == "hiformer":
         return HiFormerCTR(cfg)
+    elif arch == "hyformer":
+        return HyFormerCTR(cfg)
     elif arch == "dmin":
         from .dmin import DMINCTR
         return DMINCTR(cfg)
