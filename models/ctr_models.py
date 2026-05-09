@@ -875,6 +875,141 @@ class HyFormerCTR(BaseCTR):
 
 
 # ============================================================
+# InterFormer CTR 模型 (Meta, arXiv:2411.09852)
+# Interaction Arch + Sequence Arch + Cross Arch
+# ============================================================
+
+class InterFormerCTR(BaseCTR):
+    """
+    InterFormer adapted to the KuaiVideo CTR pipeline.
+
+    The model preserves non-sequence and sequence tokens through stacked blocks,
+    while exchanging compact gated summaries between both modes at every layer.
+    """
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        from .interformer import InterFormerBlock, TokenSummaryGate
+
+        data_cfg = cfg["data"]
+        emb_cfg = cfg["embedding"]
+        model_cfg = cfg["model"]
+
+        hidden_dim = self.hidden_dim
+        chunk_size = self.chunk_size
+        user_emb_dim = emb_cfg["user_emb_dim"]
+        item_emb_dim = emb_cfg["item_emb_dim"]
+        item_vis_dim = data_cfg["item_vis_dim"] if self.use_pretrained else 0
+        seq_input_dim = item_emb_dim + item_vis_dim
+
+        self._gradient_checkpointing = False
+        self.nonseq_dim = user_emb_dim + item_emb_dim + item_vis_dim
+        self.num_nonseq_tokens = math.ceil(self.nonseq_dim / chunk_size)
+        self.nonseq_padded_dim = self.num_nonseq_tokens * chunk_size
+
+        num_layers = model_cfg["num_layers"]
+        num_heads = model_cfg["num_heads"]
+        ffn_expansion = model_cfg.get("ffn_expansion", 4)
+        dropout = model_cfg.get("dropout", 0.0)
+        num_nonseq_summary_tokens = model_cfg.get("num_nonseq_summary_tokens", 1)
+        num_pma_tokens = model_cfg.get("num_pma_tokens", 2)
+        num_recent_tokens = model_cfg.get("num_recent_tokens", 1)
+        max_seq_len = data_cfg.get("max_seq_len", 100)
+
+        self.seq_proj = nn.Linear(seq_input_dim, hidden_dim)
+        self.initial_cls = TokenSummaryGate(self.num_nonseq_tokens, 1, hidden_dim)
+        self.blocks = nn.ModuleList([
+            InterFormerBlock(
+                num_nonseq_tokens=self.num_nonseq_tokens,
+                num_nonseq_summary_tokens=num_nonseq_summary_tokens,
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                num_pma_tokens=num_pma_tokens,
+                num_recent_tokens=num_recent_tokens,
+                ffn_expansion=ffn_expansion,
+                dropout=dropout,
+                max_seq_len=max_seq_len,
+            )
+            for _ in range(num_layers)
+        ])
+
+        output_head_units = model_cfg.get("output_head_units", [1024, 512, 256])
+        head_activation = model_cfg.get("head_activation", "Dice")
+        head_dropout = model_cfg.get("head_dropout", 0.1)
+        self.output_head = _build_output_head(
+            hidden_dim * 2, output_head_units, head_activation, head_dropout
+        )
+
+        seq_summary_tokens = 1 + num_pma_tokens + num_recent_tokens
+        interaction_tokens = self.num_nonseq_tokens + seq_summary_tokens
+        print(f"  [InterFormer] NS dim: {self.nonseq_dim}, NS tokens: {self.num_nonseq_tokens}, "
+              f"Seq summary tokens: {seq_summary_tokens}, Interaction tokens: {interaction_tokens}")
+        print(f"  Hidden (D): {hidden_dim}, Heads: {num_heads}, Layers: {num_layers}, "
+              f"PMA: {num_pma_tokens}, Recent: {num_recent_tokens}, FFN expansion: {ffn_expansion}")
+
+    def enable_gradient_checkpointing(self):
+        self._gradient_checkpointing = True
+
+    def _tokenize_nonseq_and_seq(self, user_ids, item_ids, item_vis,
+                                 pos_items, pos_lens, pos_items_vis):
+        u_emb = self.user_emb(user_ids)
+        i_emb = self.item_emb(item_ids)
+
+        if self.use_pretrained:
+            item_vis_proj = self.vis_proj(item_vis)
+            pos_id_emb = self.item_emb(pos_items)
+            pos_vis_proj = self.vis_proj(pos_items_vis)
+            seq_raw = torch.cat([pos_id_emb, pos_vis_proj], dim=-1)
+            nonseq_input = torch.cat([u_emb, i_emb, item_vis_proj], dim=-1)
+        else:
+            seq_raw = self.item_emb(pos_items)
+            nonseq_input = torch.cat([u_emb, i_emb], dim=-1)
+
+        B = nonseq_input.size(0)
+        if nonseq_input.size(-1) < self.nonseq_padded_dim:
+            nonseq_input = F.pad(
+                nonseq_input,
+                (0, self.nonseq_padded_dim - nonseq_input.size(-1)),
+            )
+        nonseq_chunks = nonseq_input.view(B, self.num_nonseq_tokens, self.chunk_size)
+        nonseq_tokens = self.proj(nonseq_chunks)
+
+        pos_mask = (
+            torch.arange(pos_items.size(1), device=pos_items.device).unsqueeze(0)
+            < pos_lens.unsqueeze(1)
+        )
+        seq_tokens = self.seq_proj(seq_raw)
+        seq_tokens = seq_tokens * pos_mask.unsqueeze(-1).to(seq_tokens.dtype)
+
+        cls_token = self.initial_cls(nonseq_tokens)
+        cls_mask = torch.ones(B, 1, dtype=torch.bool, device=pos_mask.device)
+        seq_tokens = torch.cat([cls_token, seq_tokens], dim=1)
+        seq_mask = torch.cat([cls_mask, pos_mask], dim=1)
+        return nonseq_tokens, seq_tokens, seq_mask, u_emb, i_emb
+
+    def forward(self, user_ids, item_ids, item_vis,
+                pos_items, pos_lens, neg_items, neg_lens,
+                pos_items_vis, neg_items_vis):
+        nonseq_tokens, seq_tokens, seq_mask, u_emb, i_emb = self._tokenize_nonseq_and_seq(
+            user_ids, item_ids, item_vis, pos_items, pos_lens, pos_items_vis
+        )
+
+        for block in self.blocks:
+            if self._gradient_checkpointing and self.training:
+                nonseq_tokens, seq_tokens = ckpt_fn(
+                    block, nonseq_tokens, seq_tokens, seq_mask,
+                    use_reentrant=False,
+                )
+            else:
+                nonseq_tokens, seq_tokens = block(nonseq_tokens, seq_tokens, seq_mask)
+
+        final_repr = torch.cat([nonseq_tokens.mean(dim=1), seq_tokens[:, 0]], dim=-1)
+        logits = self.output_head(final_repr).squeeze(-1)
+        reg_loss = self._get_embedding_reg_loss(u_emb, i_emb)
+        return logits, reg_loss
+
+
+# ============================================================
 # 构建模型 (统一入口)
 # ============================================================
 
@@ -890,6 +1025,8 @@ def build_model(cfg) -> nn.Module:
         return HiFormerCTR(cfg)
     elif arch == "hyformer":
         return HyFormerCTR(cfg)
+    elif arch == "interformer":
+        return InterFormerCTR(cfg)
     elif arch == "dmin":
         from .dmin import DMINCTR
         return DMINCTR(cfg)

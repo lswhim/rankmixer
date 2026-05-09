@@ -1,0 +1,68 @@
+# ============================================================
+# InterFormer-Large on KuaiVideo_x1
+# Meta InterFormer (arXiv:2411.09852)
+# chunk_size=8 -> NS tokens=24
+# seq summary tokens = CLS(1)+PMA(4)+Recent(3)=8
+# interaction tokens = 32, so D must be divisible by 32.
+# ============================================================
+
+data:
+  use_pretrained_emb: true
+  data_dir: "KuaiVideo_x1"
+  train_file: "train.csv"
+  test_file: "test.csv"
+  item_emb_file: "item_visual_emb_dim64.h5"
+  num_users: 10000
+  num_items: 3242316
+  item_hash_size: 3250000
+  item_vis_dim: 64
+  max_seq_len: 100
+  embedding_regularizer: 1.0e-4
+
+embedding:
+  user_emb_dim: 64
+  item_emb_dim: 64
+
+model:
+  arch: "interformer"
+  chunk_size: 8
+  hidden_dim: 1536
+  num_layers: 4
+  num_heads: 24
+  num_nonseq_summary_tokens: 1
+  num_pma_tokens: 4
+  num_recent_tokens: 3
+  ffn_expansion: 2
+  dropout: 0.0
+  din_hidden_units: [256, 128]
+  output_head_units: [1024, 512, 256]
+  head_activation: "Dice"
+  head_dropout: 0.1
+
+training:
+  batch_size: 512
+  learning_rate: 2.0e-4
+  weight_decay: 0.0
+  num_epochs: 100
+  grad_clip_norm: 10.0
+  optimizer: "adam"
+  scheduler: "reduce_lr_on_plateau"
+  reduce_lr_on_plateau: true
+  lr_decay_factor: 0.1
+  scheduler_eta_min: 1.0e-6
+  gradient_accumulation_steps: 8
+  gradient_checkpointing: true
+  early_stop_patience: 2
+
+logging:
+  log_interval: 100
+  eval_samples: 0
+  save_path: "interformer_large_kuaivideo.pt"
+  save_best: true
+
+seed: 42
+device: "auto"
+
+wandb:
+  project: "rankmixer"
+  tags: ["interformer", "large"]

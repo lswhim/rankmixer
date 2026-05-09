@@ -4,6 +4,7 @@ Unofficial implementation of:
 - **RankMixer: Scaling Up Ranking Models in Industrial Recommenders** (ByteDance, [arXiv:2507.15551](https://arxiv.org/abs/2507.15551))
 - **TokenMixer-Large: Scaling Up Large Ranking Models in Industrial Recommenders** (ByteDance, [arXiv:2602.06563](https://arxiv.org/abs/2602.06563))
 - **HyFormer: Revisiting the Roles of Sequence Modeling and Feature Interaction in CTR Prediction** (ByteDance, [arXiv:2601.12681](https://arxiv.org/abs/2601.12681))
+- **InterFormer: Effective Heterogeneous Interaction Learning for Click-Through Rate Prediction** (Meta, [arXiv:2411.09852](https://arxiv.org/abs/2411.09852))
 - **Actions Speak Louder than Words: Trillion-Parameter Sequential Transducers for Generative Recommendations** (Meta, [arXiv:2402.17152](https://arxiv.org/abs/2402.17152))
 - **Vanilla Transformer** — Standard Pre-LN Transformer baseline for comparison
 
@@ -75,6 +76,21 @@ Behavior Sequence → Seq K/V ┘
                             └──────────────────────────┘
                                       ↓
                                 Query Pooling → Output
+```
+
+### InterFormer (Meta)
+
+```
+Non-seq Tokens ── Cross Arch ── X_sum ──┐
+       ↑                                │
+       │                                ↓
+Interaction Arch                  Sequence Arch
+RankMixer(NS + S_sum)             PFFN(X_sum, Seq) + MHA
+       ↑                                │
+       │                                ↓
+       └──────── Cross Arch ── S_sum ───┘
+                                      ↓
+                         NS Pool + CLS Token → Output
 ```
 
 ### Vanilla Transformer (Baseline)
@@ -183,7 +199,20 @@ python train_kuaivideo.py --config config/hyformer_middle.yaml
 python train_kuaivideo.py --config config/hyformer_large.yaml
 ```
 
-### 5. Train HSTU
+### 5. Train InterFormer
+
+```bash
+# Small (Interaction + Sequence + Cross Arch)
+python train_kuaivideo.py --config config/interformer_small.yaml
+
+# Middle
+python train_kuaivideo.py --config config/interformer_middle.yaml
+
+# Large
+python train_kuaivideo.py --config config/interformer_large.yaml
+```
+
+### 6. Train HSTU
 
 ```bash
 # Small (L=4, H=8, ~36M)
@@ -196,7 +225,7 @@ python train_kuaivideo.py --config config/hstu_middle.yaml
 python train_kuaivideo.py --config config/hstu_large.yaml
 ```
 
-### 6. Train Vanilla Transformer
+### 7. Train Vanilla Transformer
 
 ```bash
 # Small (L=4, H=16, ~61M)
@@ -233,6 +262,14 @@ python train_kuaivideo.py --config config/transformer_large.yaml
 | `hyformer_small.yaml` | 16 | 768 | 2 | 12 | Query Decoding + Query Boosting |
 | `hyformer_middle.yaml` | 16 | 1024 | 4 | 16 | Query Decoding + Query Boosting |
 | `hyformer_large.yaml` | 32 | 1536 | 4 | 24 | Query Decoding + Query Boosting |
+
+### InterFormer
+
+| Config | Interaction Tokens | D | L | Heads | Paper Mechanism |
+|--------|--------------------|---|---|-------|-----------------|
+| `interformer_small.yaml` | 16 | 768 | 3 | 12 | Interaction + Sequence + Cross Arch |
+| `interformer_middle.yaml` | 16 | 1024 | 4 | 16 | Interaction + Sequence + Cross Arch |
+| `interformer_large.yaml` | 32 | 1536 | 4 | 24 | Interaction + Sequence + Cross Arch |
 
 ### HSTU
 

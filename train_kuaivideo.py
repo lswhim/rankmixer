@@ -328,7 +328,7 @@ def make_collate_fn(item_vis_emb):
 
 from models.ctr_models import (
     DINAttention, BaseCTR, RankMixerCTR, TokenMixerLargeCTR,
-    TransformerCTR, HSTUCTR, HyFormerCTR, build_model,
+    TransformerCTR, HSTUCTR, HyFormerCTR, InterFormerCTR, build_model,
 )
 
 
@@ -516,7 +516,7 @@ def main():
 
     if is_main_process():
         print("=" * 60)
-        arch_names = {"rankmixer": "RankMixer", "tokenmixer_large": "TokenMixer-Large", "hstu": "HSTU", "transformer": "Transformer", "hiformer": "HiFormer", "hyformer": "HyFormer", "dmin": "DMIN"}
+        arch_names = {"rankmixer": "RankMixer", "tokenmixer_large": "TokenMixer-Large", "hstu": "HSTU", "transformer": "Transformer", "hiformer": "HiFormer", "hyformer": "HyFormer", "interformer": "InterFormer", "dmin": "DMIN"}
         print(f"{arch_names.get(arch, arch)} on KuaiVideo_x1")
         print(f"Config: {args.config}")
         print(f"Device: {device} | World size: {world_size}")

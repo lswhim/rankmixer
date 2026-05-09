@@ -40,6 +40,15 @@ from .hyformer import (
     HyFormerBlock,
 )
 
+from .interformer import (
+    RMSNorm as InterFormerRMSNorm,
+    TokenSummaryGate,
+    PersonalizedFFN,
+    PMAPooling,
+    SequenceSummary,
+    InterFormerBlock,
+)
+
 from .ctr_models import (
     DINAttention,
     BaseCTR,
@@ -49,5 +58,6 @@ from .ctr_models import (
     HSTUCTR,
     HiFormerCTR,
     HyFormerCTR,
+    InterFormerCTR,
     build_model,
 )
