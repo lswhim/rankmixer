@@ -17,8 +17,8 @@ data:
   neg_cate_col: null
   use_user_feature: false
   num_users: 192403
-  item_hash_size: 63001
-  num_categories: 801
+  item_hash_size: 63003
+  num_categories: 803
   max_seq_len: 100
   embedding_regularizer: 5.0e-3
 embedding:

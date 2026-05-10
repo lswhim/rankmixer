@@ -167,75 +167,75 @@ python prepare_data.py
 
 ```bash
 # Small (Dense, ~150M) — 论文 RankMixer-100M
-python train_kuaivideo.py --config config/rankmixer_small.yaml
+python train_ctr.py --config config/rankmixer_small.yaml
 
 # Middle (MoE, E=8) — Sparse-MoE 扩展实验
-python train_kuaivideo.py --config config/rankmixer_middle.yaml
+python train_ctr.py --config config/rankmixer_middle.yaml
 
 # Large (Dense, ~1.2B) — 论文 RankMixer-1B
-python train_kuaivideo.py --config config/rankmixer_large.yaml
+python train_ctr.py --config config/rankmixer_large.yaml
 ```
 
 ### 3. Train TokenMixer-Large
 
 ```bash
 # Small (Dense, L=4)
-python train_kuaivideo.py --config config/tokenmixer_small.yaml
+python train_ctr.py --config config/tokenmixer_small.yaml
 
 # Middle (MoE, L=4, E=8, top_k=2)
-python train_kuaivideo.py --config config/tokenmixer_middle.yaml
+python train_ctr.py --config config/tokenmixer_middle.yaml
 ```
 
 ### 4. Train HyFormer
 
 ```bash
 # Small (Query Decoding + Query Boosting)
-python train_kuaivideo.py --config config/hyformer_small.yaml
+python train_ctr.py --config config/hyformer_small.yaml
 
 # Middle
-python train_kuaivideo.py --config config/hyformer_middle.yaml
+python train_ctr.py --config config/hyformer_middle.yaml
 
 # Large
-python train_kuaivideo.py --config config/hyformer_large.yaml
+python train_ctr.py --config config/hyformer_large.yaml
 ```
 
 ### 5. Train InterFormer
 
 ```bash
 # Small (Interaction + Sequence + Cross Arch)
-python train_kuaivideo.py --config config/interformer_small.yaml
+python train_ctr.py --config config/interformer_small.yaml
 
 # Middle
-python train_kuaivideo.py --config config/interformer_middle.yaml
+python train_ctr.py --config config/interformer_middle.yaml
 
 # Large
-python train_kuaivideo.py --config config/interformer_large.yaml
+python train_ctr.py --config config/interformer_large.yaml
 ```
 
 ### 6. Train HSTU
 
 ```bash
 # Small (L=4, H=8, ~36M)
-python train_kuaivideo.py --config config/hstu_small.yaml
+python train_ctr.py --config config/hstu_small.yaml
 
 # Middle (L=8, H=16, ~58M)
-python train_kuaivideo.py --config config/hstu_middle.yaml
+python train_ctr.py --config config/hstu_middle.yaml
 
 # Large (L=12, H=32, ~184M)
-python train_kuaivideo.py --config config/hstu_large.yaml
+python train_ctr.py --config config/hstu_large.yaml
 ```
 
 ### 7. Train Vanilla Transformer
 
 ```bash
 # Small (L=4, H=16, ~61M)
-python train_kuaivideo.py --config config/transformer_small.yaml
+python train_ctr.py --config config/transformer_small.yaml
 
 # Middle (L=6, H=16, ~108M)
-python train_kuaivideo.py --config config/transformer_middle.yaml
+python train_ctr.py --config config/transformer_middle.yaml
 
 # Large (L=8, H=24, ~259M)
-python train_kuaivideo.py --config config/transformer_large.yaml
+python train_ctr.py --config config/transformer_large.yaml
 ```
 
 ## Model Configurations
@@ -294,7 +294,7 @@ rankmixer/
 ├── rankmixer.py              # RankMixer model (v1)
 ├── tokenmixer_large.py       # TokenMixer-Large model (v2)
 ├── hstu.py                   # HSTU model (Meta)
-├── train_kuaivideo.py        # Unified training script (auto-selects model by config)
+├── train_ctr.py        # Unified training script (auto-selects model by config)
 ├── prepare_data.py           # Download & extract dataset
 ├── config/
 │   ├── rankmixer_small.yaml  # RankMixer configs

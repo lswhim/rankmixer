@@ -2,13 +2,15 @@ includes:
   - ../data/datasets/amazon_electronics.yaml
 
 model:
-  arch: "rankmixer"
-  mode: "dense"
-  chunk_size: 16
+  arch: "hyformer"
+  chunk_size: 64
   hidden_dim: 256
   num_layers: 2
+  num_heads: 4
+  num_query_tokens: 6
   ffn_expansion: 4
-  din_hidden_units: [256, 128]
+  seq_ffn_expansion: 2
+  dropout: 0.0
   output_head_units: [1024, 512, 256]
   head_activation: "Dice"
   head_dropout: 0.1
@@ -33,4 +35,4 @@ seed: 20222023
 device: "auto"
 wandb:
   project: "rankmixer"
-  tags: ["rankmixer", "amazon", "bars_aligned"]
+  tags: ["hyformer", "amazon", "bars_aligned"]

@@ -19,7 +19,7 @@ data:
   num_users: 10002
   num_items: 3242316
   item_hash_size: 632406
-  raw_item_hash_size: 3250000
+  raw_item_hash_size: 3242317
   item_vis_dim: 64
   max_seq_len: 100
   embedding_regularizer: 1.0e-4

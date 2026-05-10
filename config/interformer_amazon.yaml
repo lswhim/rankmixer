@@ -31,7 +31,7 @@ training:
   reduce_lr_on_plateau: true
   lr_decay_factor: 0.1
   scheduler_eta_min: 1.0e-6
-  early_stop_patience: 3
+  early_stop_patience: 2
 logging:
   log_interval: 500
   train_samples: 0

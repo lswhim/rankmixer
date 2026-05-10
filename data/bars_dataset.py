@@ -1,6 +1,7 @@
 import os
 import pickle
 import time
+import zipfile
 from collections import Counter
 
 import h5py
@@ -351,7 +352,17 @@ class CTRMapDataset(torch.utils.data.Dataset):
         if os.path.exists(cache_file):
             if is_main_process():
                 print(f"  加载缓存: {cache_file}")
-            data = np.load(cache_file)
+            try:
+                data = np.load(cache_file)
+            except (OSError, EOFError, zipfile.BadZipFile):
+                if is_main_process():
+                    print(f"  缓存损坏，删除并重建: {cache_file}")
+                    os.remove(cache_file)
+                data = None
+        else:
+            data = None
+
+        if data is not None:
             self.group_ids = data["group_ids"] if "group_ids" in data else data["uids"]
             self.uids = data["uids"]
             self.iids = data["iids"]

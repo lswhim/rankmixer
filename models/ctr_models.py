@@ -884,11 +884,35 @@ class HyFormerCTR(BaseCTR):
         item_emb_dim = emb_cfg["item_emb_dim"]
         item_vis_dim = data_cfg.get("item_vis_dim", 0) if self.use_pretrained else 0
         cate_emb_dim = emb_cfg.get("cate_emb_dim", item_emb_dim)
-        seq_input_dim = item_emb_dim + item_vis_dim
+        numeric_emb_dim = emb_cfg.get("numeric_emb_dim", item_emb_dim)
+
+        seq_input_dim = 0
+        if self.use_item_sequence:
+            seq_input_dim += item_emb_dim
+        if self.use_item_sequence and self.use_pretrained:
+            seq_input_dim += item_vis_dim
+        if self.use_category and self.cfg_data_has_pos_cate:
+            seq_input_dim += cate_emb_dim
+        for c in self.extra_seq_configs:
+            share = c["share_embedding"]
+            if share == "item_id":
+                seq_input_dim += item_emb_dim
+            elif share == "cate_id":
+                seq_input_dim += cate_emb_dim
+            else:
+                seq_input_dim += self.extra_cat_embs[share].embedding_dim
 
         self._gradient_checkpointing = False
         self.num_query_tokens = model_cfg.get("num_query_tokens", 6)
-        self.nonseq_dim = user_emb_dim + item_emb_dim + item_vis_dim
+        self.nonseq_dim = item_emb_dim
+        if self.use_user_feature:
+            self.nonseq_dim += user_emb_dim
+        if self.use_pretrained:
+            self.nonseq_dim += item_vis_dim
+        if self.use_category:
+            self.nonseq_dim += cate_emb_dim
+        self.nonseq_dim += sum(self.extra_cat_embs[name].embedding_dim for name in self.extra_cat_names)
+        self.nonseq_dim += len(self.numeric_cols) * numeric_emb_dim
         self.num_nonseq_tokens = math.ceil(self.nonseq_dim / chunk_size)
         self.nonseq_padded_dim = self.num_nonseq_tokens * chunk_size
 
@@ -936,19 +960,59 @@ class HyFormerCTR(BaseCTR):
         self._gradient_checkpointing = True
 
     def _tokenize_nonseq_and_seq(self, user_ids, item_ids, item_vis,
-                                 pos_items, pos_lens, pos_items_vis):
-        u_emb = self.user_emb(user_ids)
+                                 pos_items, pos_lens, neg_items, neg_lens,
+                                 pos_items_vis, neg_items_vis,
+                                 cate_ids=None, pos_cates=None, neg_cates=None,
+                                 extra_cat_ids=None, extra_seq_ids=None, extra_seq_lens=None,
+                                 numeric_vals=None):
+        u_emb = self.user_emb(user_ids) if self.use_user_feature else None
         i_emb = self.item_emb(item_ids)
+        c_emb = self.cate_emb(cate_ids) if self.use_category else None
+        extra_cat_embs = self._extra_cat_embedding_dict(extra_cat_ids)
 
-        if self.use_pretrained:
-            item_vis_proj = self.vis_proj(item_vis)
+        nonseq_parts = []
+        if self.use_user_feature:
+            nonseq_parts.append(u_emb)
+        nonseq_parts.append(i_emb)
+
+        seq_parts = []
+        seq_mask = None
+        if self.use_item_sequence:
             pos_id_emb = self.item_emb(pos_items)
+            seq_parts.append(pos_id_emb)
+            seq_mask = (
+                torch.arange(pos_items.size(1), device=pos_items.device).unsqueeze(0)
+                < pos_lens.unsqueeze(1)
+            )
+
+        if self.use_item_sequence and self.use_pretrained:
+            item_vis_proj = self.vis_proj(item_vis)
             pos_vis_proj = self.vis_proj(pos_items_vis)
-            seq_raw = torch.cat([pos_id_emb, pos_vis_proj], dim=-1)
-            nonseq_input = torch.cat([u_emb, i_emb, item_vis_proj], dim=-1)
-        else:
-            seq_raw = self.item_emb(pos_items)
-            nonseq_input = torch.cat([u_emb, i_emb], dim=-1)
+            seq_parts.append(pos_vis_proj)
+            nonseq_parts.append(item_vis_proj)
+
+        if self.use_category:
+            nonseq_parts.append(c_emb)
+            if self.cfg_data_has_pos_cate:
+                seq_parts.append(self.cate_emb(pos_cates))
+                if seq_mask is None:
+                    seq_mask = torch.arange(pos_cates.size(1), device=pos_cates.device).unsqueeze(0) < pos_lens.unsqueeze(1)
+
+        for name in self.extra_cat_names:
+            nonseq_parts.append(extra_cat_embs[name])
+        for idx, name in enumerate(self.numeric_cols):
+            nonseq_parts.append(self.numeric_projs[name](numeric_vals[:, idx:idx + 1]))
+
+        if self.extra_seq_configs:
+            for idx, seq_cfg in enumerate(self.extra_seq_configs):
+                ids = extra_seq_ids[:, idx, :]
+                lens = extra_seq_lens[:, idx]
+                seq_parts.append(self._lookup_shared_seq_embedding(seq_cfg["share_embedding"], ids))
+                mask_i = torch.arange(ids.size(1), device=ids.device).unsqueeze(0) < lens.unsqueeze(1)
+                seq_mask = mask_i if seq_mask is None else (seq_mask | mask_i)
+
+        nonseq_input = torch.cat(nonseq_parts, dim=-1)
+        seq_raw = torch.cat(seq_parts, dim=-1)
 
         B = nonseq_input.size(0)
         if nonseq_input.size(-1) < self.nonseq_padded_dim:
@@ -959,19 +1023,22 @@ class HyFormerCTR(BaseCTR):
         nonseq_chunks = nonseq_input.view(B, self.num_nonseq_tokens, self.chunk_size)
         nonseq_tokens = self.proj(nonseq_chunks)
 
-        seq_mask = (
-            torch.arange(pos_items.size(1), device=pos_items.device).unsqueeze(0)
-            < pos_lens.unsqueeze(1)
-        )
         seq_tokens = self.seq_proj(seq_raw)
         seq_tokens = seq_tokens * seq_mask.unsqueeze(-1).to(seq_tokens.dtype)
         return nonseq_tokens, seq_tokens, seq_mask, u_emb, i_emb
 
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
-                pos_items_vis, neg_items_vis):
+                pos_items_vis, neg_items_vis,
+                cate_ids=None, pos_cates=None, neg_cates=None,
+                extra_cat_ids=None, extra_seq_ids=None, extra_seq_lens=None,
+                numeric_vals=None):
         nonseq_tokens, seq_tokens, seq_mask, u_emb, i_emb = self._tokenize_nonseq_and_seq(
-            user_ids, item_ids, item_vis, pos_items, pos_lens, pos_items_vis
+            user_ids, item_ids, item_vis,
+            pos_items, pos_lens, neg_items, neg_lens,
+            pos_items_vis, neg_items_vis,
+            cate_ids, pos_cates, neg_cates,
+            extra_cat_ids, extra_seq_ids, extra_seq_lens, numeric_vals,
         )
 
         queries = self.query_generator(nonseq_tokens, seq_tokens, seq_mask)
