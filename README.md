@@ -85,7 +85,7 @@ Non-seq Tokens ── Cross Arch ── X_sum ──┐
        ↑                                │
        │                                ↓
 Interaction Arch                  Sequence Arch
-RankMixer(NS + S_sum)             PFFN(X_sum, Seq) + MHA
+DHEN(DOT + DCN)                   PFFN(X_sum, Seq) + MHA
        ↑                                │
        │                                ↓
        └──────── Cross Arch ── S_sum ───┘
@@ -267,9 +267,9 @@ python train_kuaivideo.py --config config/transformer_large.yaml
 
 | Config | Interaction Tokens | D | L | Heads | Paper Mechanism |
 |--------|--------------------|---|---|-------|-----------------|
-| `interformer_small.yaml` | 16 | 768 | 3 | 12 | Interaction + Sequence + Cross Arch |
-| `interformer_middle.yaml` | 16 | 1024 | 4 | 16 | Interaction + Sequence + Cross Arch |
-| `interformer_large.yaml` | 32 | 1536 | 4 | 24 | Interaction + Sequence + Cross Arch |
+| `interformer_small.yaml` | 11 | 64 | 3 | 4 | DHEN layers=1, CLS=4, PMA=2, Recent=2 |
+| `interformer_middle.yaml` | 11 | 64 | 4 | 4 | DHEN layers=2, CLS=4, PMA=2, Recent=2 |
+| `interformer_large.yaml` | 11 | 64 | 4 | 8 | DHEN layers=3, CLS=4, PMA=2, Recent=2 |
 
 ### HSTU
 

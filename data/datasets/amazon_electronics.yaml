@@ -1,0 +1,27 @@
+data:
+  dataset_id: "amazonelectronics_x1"
+  use_pretrained_emb: false
+  data_dir: "AmazonElectronics_x1"
+  cache_version: "bars_remap_v1"
+  use_bars_feature_encoder: true
+  min_categr_count: 1
+  train_file: "train.csv"
+  test_file: "test.csv"
+  user_col: "user_id"
+  item_col: "item_id"
+  label_col: "label"
+  cate_col: "cate_id"
+  pos_item_col: "item_history"
+  pos_cate_col: "cate_history"
+  neg_item_col: null
+  neg_cate_col: null
+  use_user_feature: false
+  num_users: 192403
+  item_hash_size: 63001
+  num_categories: 801
+  max_seq_len: 100
+  embedding_regularizer: 5.0e-3
+embedding:
+  user_emb_dim: 64
+  item_emb_dim: 64
+  cate_emb_dim: 64

@@ -53,6 +53,8 @@ class MLPBlock(nn.Module):
                 layers.append(Dice(dims[i + 1]))
             elif hidden_activation == "ReLU":
                 layers.append(nn.ReLU())
+            elif hidden_activation in ("SiLU", "Swish"):
+                layers.append(nn.SiLU())
             elif hidden_activation == "PReLU":
                 layers.append(nn.PReLU())
             if dropout_rate > 0:

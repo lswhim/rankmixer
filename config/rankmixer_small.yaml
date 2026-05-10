@@ -1,51 +1,17 @@
-# ============================================================
-# RankMixer-Small on KuaiVideo_x1
-# 对应论文 arXiv:2507.15551 RankMixer-100M 配置
-#
-# 论文配置: T=16, D=768, L=2, k=4, 全 Dense (无 MoE)
-# chunk_size=20 → T = ceil(320/20) = 16, D=768, D/T=48
-# total_dim = 64+64+64+128 = 320 (user_emb + item_emb + item_vis + pos_seq_enc)
-# 与 BARS benchmark 对齐: neg_seq 不参与建模
-# 双通道序列: seq_emb_dim = item_emb_dim(64) + item_vis_dim(64) = 128
-# ============================================================
+includes:
+  - ../data/datasets/kuaivideo.yaml
 
-# --- 数据配置 (与 FuxiCTR benchmark 对齐) ---
-data:
-  use_pretrained_emb: true
-  data_dir: "KuaiVideo_x1"
-  train_file: "train.csv"
-  test_file: "test.csv"
-  item_emb_file: "item_visual_emb_dim64.h5"
-  num_users: 10000
-  num_items: 3242316
-  item_hash_size: 3250000
-  item_vis_dim: 64
-  max_seq_len: 100
-  embedding_regularizer: 1.0e-4          # L2 正则 (与 FuxiCTR 对齐)
-
-# --- 特征 Embedding 配置 ---
-embedding:
-  user_emb_dim: 64
-  item_emb_dim: 64
-
-# --- RankMixer 模型配置 ---
-# 论文 RankMixer-100M: 全 Dense 架构, L=2
 model:
   arch: "rankmixer"
-  mode: "dense"                          # "dense" 或 "moe" 二选一
-  chunk_size: 20                         # d → T = ceil(320/20) = 16
-  hidden_dim: 768                        # D
-  num_layers: 2                          # L=2
-  ffn_expansion: 4                       # k
-  # mode=moe 时才需要:
-  #   num_experts: 8
-  #   l1_lambda: 0.01
-  din_hidden_units: [256, 128]           # P1: DIN attention MLP 隐藏层
-  output_head_units: [1024, 512, 256]    # P3: 预测头 MLP 隐藏层 (对齐 BARS)
-  head_activation: "Dice"                # 对齐 BARS DIN/DMIN
-  head_dropout: 0.1                      # 对齐 BARS DIN/DMIN
-
-# --- 训练配置 (与 FuxiCTR benchmark 对齐) ---
+  mode: "dense"
+  chunk_size: 20
+  hidden_dim: 768
+  num_layers: 2
+  ffn_expansion: 4
+  din_hidden_units: [512, 256]
+  output_head_units: [1024, 512, 256]
+  head_activation: "Dice"
+  head_dropout: 0.1
 training:
   batch_size: 4096
   learning_rate: 1.0e-3
@@ -53,26 +19,17 @@ training:
   num_epochs: 100
   grad_clip_norm: 10.0
   optimizer: "adam"
-  scheduler: "reduce_lr_on_plateau"
+  monitor: {"gAUC": 1, "AUC": 1}
   reduce_lr_on_plateau: true
   lr_decay_factor: 0.1
   scheduler_eta_min: 1.0e-6
   early_stop_patience: 2
-
-# --- 日志与评估配置 ---
 logging:
   log_interval: 200
   eval_samples: 0
-  save_path: "rankmixer_small_kuaivideo.pt"
   save_best: true
-
-# --- 随机种子 ---
-seed: 42
-
-# --- 设备配置 ---
+seed: 20222023
 device: "auto"
-
-# --- wandb 配置 ---
 wandb:
   project: "rankmixer"
-  tags: ["rankmixer", "small", "dense"]
+  tags: ["rankmixer", "kuaivideo", "bars_aligned"]

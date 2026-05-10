@@ -1,0 +1,47 @@
+data:
+  dataset_id: "taobaoad_x1"
+  use_pretrained_emb: false
+  data_dir: "TaobaoAd_x1"
+  cache_version: "bars_remap_v1"
+  use_bars_feature_encoder: true
+  min_categr_count: 10
+  train_file: "train.csv"
+  test_file: "test.csv"
+  user_col: "userid"
+  item_col: "adgroup_id"
+  label_col: "clk"
+  cate_col: "cate_id"
+  pos_item_col: null
+  pos_cate_col: null
+  neg_item_col: null
+  neg_cate_col: null
+  num_users: 403958
+  item_hash_size: 246851
+  num_categories: 11330
+  extra_categorical_cols:
+    - {name: "cms_segid", vocab_size: 99}
+    - {name: "cms_group_id", vocab_size: 15}
+    - {name: "final_gender_code", vocab_size: 4}
+    - {name: "age_level", vocab_size: 9}
+    - {name: "pvalue_level", vocab_size: 6}
+    - {name: "shopping_level", vocab_size: 5}
+    - {name: "occupation", vocab_size: 4}
+    - {name: "new_user_class_level", vocab_size: 7}
+    - {name: "campaign_id", vocab_size: 191771}
+    - {name: "customer", vocab_size: 132136}
+    - {name: "brand", vocab_size: 308870}
+    - {name: "pid", vocab_size: 4}
+    - {name: "btag", vocab_size: 6}
+  numeric_cols: ["price"]
+  extra_sequence_cols:
+    - {name: "cate_his", share_embedding: "cate_id", vocab_size: 11330}
+    - {name: "brand_his", share_embedding: "brand", vocab_size: 308870}
+    - {name: "btag_his", share_embedding: "btag", vocab_size: 6}
+  max_seq_len: 50
+  embedding_regularizer: 5.0e-6
+embedding:
+  user_emb_dim: 32
+  item_emb_dim: 32
+  cate_emb_dim: 32
+  extra_cat_emb_dim: 32
+  numeric_emb_dim: 32

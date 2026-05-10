@@ -1,5 +1,5 @@
 includes:
-  - ../data/datasets/kuaivideo.yaml
+  - ../data/datasets/taobao_ad.yaml
 
 model:
   arch: "interformer"
@@ -11,17 +11,17 @@ model:
   num_cls_tokens: 4
   num_pma_tokens: 2
   num_recent_tokens: 2
-  use_neg_sequence: true
-  dhen_layers: 1
+  use_neg_sequence: false
+  dhen_layers: 3
   dcn_rank: 32
   ffn_expansion: 4
   dropout: 0.0
   din_hidden_units: [512, 256]
-  output_head_units: [1024, 512, 256]
+  output_head_units: [512, 256, 128]
   head_activation: "SiLU"
   head_dropout: 0.1
 training:
-  batch_size: 4096
+  batch_size: 8192
   learning_rate: 1.0e-3
   weight_decay: 0.0
   num_epochs: 100
@@ -34,10 +34,11 @@ training:
   early_stop_patience: 2
 logging:
   log_interval: 200
+  train_samples: 0
   eval_samples: 0
   save_best: true
 seed: 20222023
 device: "auto"
 wandb:
   project: "rankmixer"
-  tags: ["interformer", "kuaivideo", "bars_aligned"]
+  tags: ["interformer", "taobao", "bars_aligned"]

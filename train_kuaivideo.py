@@ -15,23 +15,17 @@
 
 import os
 import sys
-import csv
 import time
-import math
 import random
 from datetime import datetime
 import argparse
 import numpy as np
-import pandas as pd
-import h5py
 import yaml
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-from typing import Tuple
 from sklearn.metrics import roc_auc_score, log_loss
 import wandb
 
@@ -75,10 +69,31 @@ def cleanup_distributed():
 # 配置加载
 # ============================================================
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def load_config(config_path: str) -> dict:
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
-    return cfg
+    includes = cfg.pop("includes", []) or []
+    if isinstance(includes, str):
+        includes = [includes]
+
+    merged = {}
+    config_dir = os.path.dirname(config_path)
+    for include_path in includes:
+        full_path = include_path
+        if not os.path.isabs(full_path):
+            full_path = os.path.normpath(os.path.join(config_dir, include_path))
+        merged = _deep_merge(merged, load_config(full_path))
+    return _deep_merge(merged, cfg)
 
 
 def get_device(cfg_device: str) -> str:
@@ -95,241 +110,13 @@ def get_device(cfg_device: str) -> str:
     return cfg_device
 
 
-# ============================================================
-# 预训练 Embedding 加载
-# ============================================================
-
-def load_pretrained_embeddings(cfg):
-    """加载预训练 embedding。与 FuxiCTR benchmark 对齐: 只加载 item visual emb，不用 user visual emb。"""
-    data_cfg = cfg["data"]
-    use_pretrained = data_cfg.get("use_pretrained_emb", True)
-
-    if not use_pretrained:
-        if is_main_process():
-            print("跳过预训练 embedding 加载 (use_pretrained_emb=false)")
-        return None
-
-    project_root = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.join(project_root, data_cfg["data_dir"])
-
-    if is_main_process():
-        print("加载预训练 item visual embedding ...")
-
-    with h5py.File(os.path.join(data_dir, data_cfg["item_emb_file"]), "r") as f:
-        item_keys = f["key"][:]
-        item_vals = f["value"][:].astype(np.float32)
-
-    item_hash_size = data_cfg["item_hash_size"]
-    item_vis_dim = data_cfg["item_vis_dim"]
-    item_emb_table = np.zeros((item_hash_size, item_vis_dim), dtype=np.float32)
-    for k, v in zip(item_keys, item_vals):
-        hk = int(k) % item_hash_size
-        item_emb_table[hk] = v
-
-    if is_main_process():
-        print(f"  Item visual emb: {item_emb_table.shape}")
-    return item_emb_table
-
-
-# ============================================================
-# 数据集 (方案 C: 预处理缓存 + 延迟查表)
-# ============================================================
-
-def _parse_seq_column(series, item_hash_size, max_seq_len):
-    """
-    向量化解析序列列 (如 pos_items / neg_items)。
-    输入: pandas Series，每个元素是 "id1^id2^id3" 或 NaN
-    输出: ids_arr [N, max_seq_len] int32, lens_arr [N] int32
-    """
-    N = len(series)
-    ids_arr = np.zeros((N, max_seq_len), dtype=np.int32)
-    lens_arr = np.zeros(N, dtype=np.int32)
-
-    for i, val in enumerate(series):
-        if not isinstance(val, str) or val == "":
-            continue
-        parts = val.split("^")
-        seq = [int(x) % item_hash_size for x in parts]
-        seq = seq[-max_seq_len:]
-        slen = len(seq)
-        ids_arr[i, :slen] = seq
-        lens_arr[i] = slen
-
-    return ids_arr, lens_arr
-
-
-def _preprocess_csv_to_cache(csv_path, cache_path, num_users, item_hash_size, max_seq_len,
-                              max_samples=None):
-    """
-    用 pandas 批量解析 CSV 并存为 .npz 缓存。
-    比逐行 csv.reader 快 5-10x (pandas C 引擎 + 向量化操作)。
-    """
-    if is_main_process():
-        print(f"  预处理 CSV → 缓存 (pandas 加速): {csv_path}")
-        t0 = time.time()
-
-    # pandas C 引擎批量读取，只读需要的列
-    df = pd.read_csv(
-        csv_path,
-        usecols=[1, 2, 3, 6, 7],
-        names=["user_id", "item_id", "is_click", "pos_items", "neg_items"],
-        header=0,
-        dtype={"user_id": np.int64, "item_id": np.int64, "is_click": np.float32,
-               "pos_items": str, "neg_items": str},
-        nrows=max_samples,
-        engine="c",
-        na_filter=False,
-    )
-    if is_main_process():
-        print(f"    CSV 读取完成: {len(df)} 行, 耗时 {time.time() - t0:.1f}s")
-
-    # 向量化处理标量列
-    uids = np.minimum(df["user_id"].values, num_users - 1).astype(np.int32)
-    iids = (df["item_id"].values % item_hash_size).astype(np.int32)
-    labels = df["is_click"].values.astype(np.float32)
-
-    # 解析序列列
-    if is_main_process():
-        print(f"    解析 pos_items 序列 ...")
-    pos_ids_arr, pos_lens = _parse_seq_column(df["pos_items"], item_hash_size, max_seq_len)
-
-    if is_main_process():
-        print(f"    解析 neg_items 序列 ...")
-    neg_ids_arr, neg_lens = _parse_seq_column(df["neg_items"], item_hash_size, max_seq_len)
-
-    del df  # 释放 DataFrame 内存
-
-    np.savez(
-        cache_path,
-        uids=uids, iids=iids, labels=labels,
-        pos_ids=pos_ids_arr, pos_lens=pos_lens,
-        neg_ids=neg_ids_arr, neg_lens=neg_lens,
-    )
-    if is_main_process():
-        size_mb = os.path.getsize(cache_path + ".npz") / 1024 / 1024
-        elapsed = time.time() - t0
-        print(f"  缓存已保存: {cache_path}.npz ({size_mb:.1f} MB, {len(uids)} 条样本, 总耗时 {elapsed:.1f}s)")
-
-    return uids, iids, labels, pos_ids_arr, pos_lens, neg_ids_arr, neg_lens
-
-
-class KuaiVideoMapDataset(torch.utils.data.Dataset):
-    """
-    高效 Map-style Dataset (方案 C: 预处理缓存 + collate 批量查表)。
-
-    - 首次运行: 解析 CSV → 存为 .npz 缓存 (只存 int32 ID + float32 label)
-    - 后续运行: 直接加载 .npz (~秒级)
-    - __getitem__ 只返回轻量 ID, embedding 查表在 collate_fn 批量完成
-    - Shuffle 行为与 FuxiCTR 完全一致: Map-style + DataLoader shuffle=True
-    """
-    def __init__(self, csv_path, item_vis_emb, cfg, max_samples=None):
-        # Dataset 不持有 item_vis_emb (避免 DataLoader worker fork 时复制大数组)
-
-        num_users = cfg["data"]["num_users"]
-        item_hash_size = cfg["data"]["item_hash_size"]
-        max_seq_len = cfg["data"].get("max_seq_len", 100)
-        self.max_seq_len = max_seq_len
-
-        # 确定缓存路径: 与 csv 同目录, 同名 .npz
-        base = os.path.splitext(csv_path)[0]
-        suffix = f"_n{max_samples}" if max_samples else ""
-        cache_path = f"{base}_cache_seq{max_seq_len}{suffix}"
-        cache_file = cache_path + ".npz"
-
-        if os.path.exists(cache_file):
-            if is_main_process():
-                print(f"  加载缓存: {cache_file}")
-            data = np.load(cache_file)
-            self.uids = data["uids"]
-            self.iids = data["iids"]
-            self.labels = data["labels"]
-            self.pos_ids = data["pos_ids"]
-            self.pos_lens = data["pos_lens"]
-            self.neg_ids = data["neg_ids"]
-            self.neg_lens = data["neg_lens"]
-            if max_samples and len(self.uids) > max_samples:
-                self.uids = self.uids[:max_samples]
-                self.iids = self.iids[:max_samples]
-                self.labels = self.labels[:max_samples]
-                self.pos_ids = self.pos_ids[:max_samples]
-                self.pos_lens = self.pos_lens[:max_samples]
-                self.neg_ids = self.neg_ids[:max_samples]
-                self.neg_lens = self.neg_lens[:max_samples]
-            if is_main_process():
-                print(f"  缓存加载完成: {len(self.uids)} 条样本")
-        else:
-            (self.uids, self.iids, self.labels,
-             self.pos_ids, self.pos_lens,
-             self.neg_ids, self.neg_lens) = _preprocess_csv_to_cache(
-                csv_path, cache_path, num_users, item_hash_size, max_seq_len,
-                max_samples=max_samples,
-            )
-
-    def __len__(self):
-        return len(self.uids)
-
-    def __getitem__(self, idx):
-        # 只返回轻量 ID，不做 embedding 查表 (查表在 collate_fn 批量完成)
-        return (
-            int(self.uids[idx]),
-            int(self.iids[idx]),
-            self.pos_ids[idx],                # numpy int32 [max_seq_len]
-            int(self.pos_lens[idx]),
-            self.neg_ids[idx],                # numpy int32 [max_seq_len]
-            int(self.neg_lens[idx]),
-            float(self.labels[idx]),
-        )
-
-
-def make_collate_fn(item_vis_emb):
-    """
-    创建 collate_fn 闭包，在 collate 阶段批量查 embedding。
-    numpy 高级索引对整个 batch 一次性完成，比逐条 __getitem__ 查表快很多。
-    """
-    use_pretrained = item_vis_emb is not None
-
-    def collate_fn(batch):
-        uids, iids, pos_ids_list, pos_lens, neg_ids_list, neg_lens, labels = zip(*batch)
-
-        uids_t = torch.tensor(uids, dtype=torch.long)
-        iids_t = torch.tensor(iids, dtype=torch.long)
-        pos_lens_t = torch.tensor(pos_lens, dtype=torch.long)
-        neg_lens_t = torch.tensor(neg_lens, dtype=torch.long)
-        labels_t = torch.tensor(labels, dtype=torch.float32)
-
-        # 堆叠 ID 数组: [B, max_seq_len]
-        pos_ids_np = np.stack(pos_ids_list)       # [B, S] int32
-        neg_ids_np = np.stack(neg_ids_list)       # [B, S] int32
-        pos_items_t = torch.from_numpy(pos_ids_np.astype(np.int64))
-        neg_items_t = torch.from_numpy(neg_ids_np.astype(np.int64))
-
-        if use_pretrained:
-            # 批量查表: numpy 高级索引一次性完成
-            iids_np = np.array(iids, dtype=np.int32)
-            item_vis_t = torch.from_numpy(item_vis_emb[iids_np].copy())         # [B, vis_dim]
-            pos_vis_t = torch.from_numpy(item_vis_emb[pos_ids_np].copy())       # [B, S, vis_dim]
-            neg_vis_t = torch.from_numpy(item_vis_emb[neg_ids_np].copy())       # [B, S, vis_dim]
-        else:
-            B = len(uids)
-            item_vis_t = torch.zeros(B, 0, dtype=torch.float32)
-            S = pos_ids_np.shape[1]
-            pos_vis_t = torch.zeros(B, S, 0, dtype=torch.float32)
-            neg_vis_t = torch.zeros(B, S, 0, dtype=torch.float32)
-
-        return (
-            uids_t, iids_t, item_vis_t,
-            pos_items_t, pos_lens_t,
-            neg_items_t, neg_lens_t,
-            pos_vis_t, neg_vis_t,
-            labels_t,
-        )
-
-    return collate_fn
-
-from models.ctr_models import (
-    DINAttention, BaseCTR, RankMixerCTR, TokenMixerLargeCTR,
-    TransformerCTR, HSTUCTR, HyFormerCTR, InterFormerCTR, build_model,
+from data.bars_dataset import (
+    CTRMapDataset as KuaiVideoMapDataset,
+    load_pretrained_embeddings,
+    make_collate_fn,
 )
+
+from models.ctr_models import build_model
 
 
 # ============================================================
@@ -379,9 +166,12 @@ def evaluate(model, dataloader, device):
     all_labels, all_preds, all_uids = [], [], []
     with torch.no_grad():
         for batch in dataloader:
-            (uids, iids, i_vis,
+            (group_ids, uids, iids, i_vis,
              pos_items, pos_lens, neg_items, neg_lens,
-             pos_vis, neg_vis, labels) = batch
+             pos_vis, neg_vis,
+             cate_ids, pos_cates, neg_cates,
+             extra_cat_ids, extra_seq_ids, extra_seq_lens, numeric_vals,
+             labels) = batch
             with torch.no_grad():
                 output = raw_model(
                     uids.to(device), iids.to(device),
@@ -389,12 +179,15 @@ def evaluate(model, dataloader, device):
                     pos_items.to(device), pos_lens.to(device),
                     neg_items.to(device), neg_lens.to(device),
                     pos_vis.to(device), neg_vis.to(device),
+                    cate_ids.to(device), pos_cates.to(device), neg_cates.to(device),
+                    extra_cat_ids.to(device), extra_seq_ids.to(device),
+                    extra_seq_lens.to(device), numeric_vals.to(device),
                 )
                 logits = output[0]
             probs = torch.sigmoid(logits.float()).cpu()
             all_labels.append(labels)
             all_preds.append(probs)
-            all_uids.append(uids)
+            all_uids.append(group_ids)
 
     all_labels = torch.cat(all_labels)
     all_preds = torch.cat(all_preds)
@@ -447,6 +240,18 @@ def evaluate(model, dataloader, device):
     gauc = compute_gauc(all_uids, all_labels, all_preds)
     logloss = log_loss(all_labels, all_preds)
     return auc, gauc, logloss
+
+
+def compute_monitor_value(monitor_cfg, auc, gauc, logloss):
+    """Compute BARS/FuxiCTR-style early-stop monitor from metric config."""
+    metrics = {"AUC": auc, "gAUC": gauc, "logloss": logloss}
+    if monitor_cfg is None:
+        return gauc + auc
+    if isinstance(monitor_cfg, str):
+        return metrics[monitor_cfg]
+    if isinstance(monitor_cfg, dict):
+        return sum(metrics[name] * weight for name, weight in monitor_cfg.items())
+    raise ValueError(f"Unsupported monitor config: {monitor_cfg}")
 
 
 # ============================================================
@@ -517,7 +322,7 @@ def main():
     if is_main_process():
         print("=" * 60)
         arch_names = {"rankmixer": "RankMixer", "tokenmixer_large": "TokenMixer-Large", "hstu": "HSTU", "transformer": "Transformer", "hiformer": "HiFormer", "hyformer": "HyFormer", "interformer": "InterFormer", "dmin": "DMIN"}
-        print(f"{arch_names.get(arch, arch)} on KuaiVideo_x1")
+        print(f"{arch_names.get(arch, arch)} on {cfg['data'].get('data_dir', 'dataset')}")
         print(f"Config: {args.config}")
         print(f"Device: {device} | World size: {world_size}")
         print("=" * 60)
@@ -592,7 +397,9 @@ def main():
     # 全量加载数据到内存 (与 FuxiCTR 对齐: 全局 shuffle)
     if is_main_process():
         print("\n加载训练集 ...")
-    train_dataset = KuaiVideoMapDataset(train_csv, item_vis_emb, cfg)
+    train_samples = log_cfg.get("train_samples", 0)
+    train_samples = train_samples if train_samples > 0 else None
+    train_dataset = KuaiVideoMapDataset(train_csv, item_vis_emb, cfg, max_samples=train_samples)
     if is_main_process():
         print("加载测试集 ...")
     eval_samples = log_cfg["eval_samples"] if log_cfg["eval_samples"] > 0 else None
@@ -660,9 +467,12 @@ def main():
         optimizer.zero_grad()
 
         for batch in train_loader:
-            (uids, iids, i_vis,
+            (group_ids, uids, iids, i_vis,
              pos_items, pos_lens, neg_items, neg_lens,
-             pos_vis, neg_vis, labels) = batch
+             pos_vis, neg_vis,
+             cate_ids, pos_cates, neg_cates,
+             extra_cat_ids, extra_seq_ids, extra_seq_lens, numeric_vals,
+             labels) = batch
             uids = uids.to(device)
             iids = iids.to(device)
             i_vis = i_vis.to(device)
@@ -672,6 +482,13 @@ def main():
             neg_lens = neg_lens.to(device)
             pos_vis = pos_vis.to(device)
             neg_vis = neg_vis.to(device)
+            cate_ids = cate_ids.to(device)
+            pos_cates = pos_cates.to(device)
+            neg_cates = neg_cates.to(device)
+            extra_cat_ids = extra_cat_ids.to(device)
+            extra_seq_ids = extra_seq_ids.to(device)
+            extra_seq_lens = extra_seq_lens.to(device)
+            numeric_vals = numeric_vals.to(device)
             labels = labels.to(device)
 
             # DDP: 非累积最后一步时关闭梯度同步，节省通信开销
@@ -684,6 +501,8 @@ def main():
                     uids, iids, i_vis,
                     pos_items, pos_lens, neg_items, neg_lens,
                     pos_vis, neg_vis,
+                    cate_ids, pos_cates, neg_cates,
+                    extra_cat_ids, extra_seq_ids, extra_seq_lens, numeric_vals,
                 )
 
                 if arch == "tokenmixer_large":
@@ -806,8 +625,8 @@ def main():
             }, step=global_step)
 
             if log_cfg.get("save_best", True):
-                # Monitor = gAUC + AUC (与 FuxiCTR monitor: {"gAUC": 1, "AUC": 1} 对齐)
-                current_monitor = gauc + auc
+                monitor_cfg = train_cfg.get("monitor", log_cfg.get("monitor"))
+                current_monitor = compute_monitor_value(monitor_cfg, auc, gauc, logloss)
                 if current_monitor > best_monitor:
                     best_monitor = current_monitor
                     best_auc = auc

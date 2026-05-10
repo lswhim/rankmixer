@@ -110,31 +110,79 @@ class BaseCTR(nn.Module):
 
         user_emb_dim = emb_cfg["user_emb_dim"]
         item_emb_dim = emb_cfg["item_emb_dim"]
+        self.use_user_feature = data_cfg.get("use_user_feature", True)
         self.use_pretrained = data_cfg.get("use_pretrained_emb", True)
-        item_vis_dim = data_cfg["item_vis_dim"] if self.use_pretrained else 0
+        item_vis_dim = data_cfg.get("item_vis_dim", 0) if self.use_pretrained else 0
+        self.use_category = data_cfg.get("num_categories", 0) > 0
+        self.use_item_sequence = data_cfg.get("pos_item_col", "pos_items") is not None
+        self.cfg_data_has_pos_cate = data_cfg.get("pos_cate_col") is not None
+        cate_emb_dim = emb_cfg.get("cate_emb_dim", item_emb_dim)
+        extra_cat_emb_dim = emb_cfg.get("extra_cat_emb_dim", item_emb_dim)
+        numeric_emb_dim = emb_cfg.get("numeric_emb_dim", item_emb_dim)
         chunk_size = model_cfg["chunk_size"]
         hidden_dim = model_cfg["hidden_dim"]
         self.embedding_regularizer = data_cfg.get("embedding_regularizer", 0.0)
+        self.extra_cat_configs = data_cfg.get("extra_categorical_cols", [])
+        self.extra_cat_names = [c["name"] for c in self.extra_cat_configs]
+        self.extra_seq_configs = data_cfg.get("extra_sequence_cols", [])
+        self.numeric_cols = data_cfg.get("numeric_cols", [])
 
-        self.user_emb = nn.Embedding(data_cfg["num_users"], user_emb_dim)
+        if self.use_user_feature:
+            self.user_emb = nn.Embedding(data_cfg["num_users"], user_emb_dim)
         self.item_emb = nn.Embedding(data_cfg["item_hash_size"], item_emb_dim)
+        if self.use_category:
+            self.cate_emb = nn.Embedding(data_cfg["num_categories"], cate_emb_dim)
+        self.extra_cat_embs = nn.ModuleDict({
+            c["name"]: nn.Embedding(c["vocab_size"], c.get("embedding_dim", extra_cat_emb_dim))
+            for c in self.extra_cat_configs
+        })
+        self.numeric_projs = nn.ModuleDict({
+            name: nn.Linear(1, numeric_emb_dim)
+            for name in self.numeric_cols
+        })
 
         # P2: xavier_uniform_ 初始化 embedding (对齐 FuxiCTR)
-        nn.init.xavier_uniform_(self.user_emb.weight)
+        if self.use_user_feature:
+            nn.init.xavier_uniform_(self.user_emb.weight)
         nn.init.xavier_uniform_(self.item_emb.weight)
+        if self.use_category:
+            nn.init.xavier_uniform_(self.cate_emb.weight)
+        for emb in self.extra_cat_embs.values():
+            nn.init.xavier_uniform_(emb.weight)
 
         # Pretrained embedding 投影层 (与 FuxiCTR 对齐: nn.Linear(64,64,bias=False))
         if self.use_pretrained:
             self.vis_proj = nn.Linear(item_vis_dim, item_vis_dim, bias=False)
 
         # P1: DIN 序列注意力, hidden_units 可配置 (默认 [256, 128], 增大容量)
-        seq_emb_dim = item_emb_dim + item_vis_dim if self.use_pretrained else item_emb_dim
+        seq_emb_dim = 0
+        if self.use_item_sequence:
+            seq_emb_dim += item_emb_dim
+        if self.use_item_sequence and self.use_pretrained:
+            seq_emb_dim += item_vis_dim
+        if self.use_category and data_cfg.get("pos_cate_col") is not None:
+            seq_emb_dim += cate_emb_dim
+        for c in self.extra_seq_configs:
+            share = c["share_embedding"]
+            if share == "item_id":
+                seq_emb_dim += item_emb_dim
+            elif share == "cate_id":
+                seq_emb_dim += cate_emb_dim
+            else:
+                seq_emb_dim += self.extra_cat_embs[share].embedding_dim
         din_hidden_units = model_cfg.get("din_hidden_units", [256, 128])
         self.pos_din_attn = DINAttention(seq_emb_dim, hidden_units=din_hidden_units)
 
-        # total_dim: user_emb + item_emb + item_vis + pos_seq_enc
-        total_dim = (user_emb_dim + item_emb_dim + item_vis_dim
-                     + seq_emb_dim)
+        # total_dim: optional user_emb + item_emb + optional item_vis/category + pos_seq_enc
+        total_dim = item_emb_dim + seq_emb_dim
+        if self.use_user_feature:
+            total_dim += user_emb_dim
+        if self.use_pretrained:
+            total_dim += item_vis_dim
+        if self.use_category:
+            total_dim += cate_emb_dim
+        total_dim += sum(self.extra_cat_embs[name].embedding_dim for name in self.extra_cat_names)
+        total_dim += len(self.numeric_cols) * numeric_emb_dim
         self.num_tokens = math.ceil(total_dim / chunk_size)
         self.padded_dim = self.num_tokens * chunk_size
         self.chunk_size = chunk_size
@@ -143,6 +191,28 @@ class BaseCTR(nn.Module):
 
         self.proj = nn.Linear(chunk_size, hidden_dim)
 
+    def _extra_cat_embedding_dict(self, extra_cat_ids):
+        if not self.extra_cat_names:
+            return {}
+        return {
+            name: self.extra_cat_embs[name](extra_cat_ids[:, idx])
+            for idx, name in enumerate(self.extra_cat_names)
+        }
+
+    def _lookup_shared_seq_embedding(self, share_name, ids):
+        if share_name == "item_id":
+            return self.item_emb(ids)
+        if share_name == "cate_id":
+            return self.cate_emb(ids)
+        return self.extra_cat_embs[share_name](ids)
+
+    def _lookup_shared_target_embedding(self, share_name, i_emb, c_emb, extra_cat_embs):
+        if share_name == "item_id":
+            return i_emb
+        if share_name == "cate_id":
+            return c_emb
+        return extra_cat_embs[share_name]
+
     def _get_embedding_reg_loss(self, u_emb, i_emb):
         """
         P0: 计算 batch-level embedding L2 正则损失。
@@ -150,16 +220,19 @@ class BaseCTR(nn.Module):
         公式: λ/2 * (mean(||u_emb||^2) + mean(||i_emb||^2))
         """
         if self.embedding_regularizer <= 0:
-            return torch.tensor(0.0, device=u_emb.device)
-        reg = self.embedding_regularizer / 2.0 * (
-            u_emb.norm(2, dim=-1).pow(2).mean() +
-            i_emb.norm(2, dim=-1).pow(2).mean()
-        )
+            return torch.tensor(0.0, device=i_emb.device)
+        terms = [i_emb.norm(2, dim=-1).pow(2).mean()]
+        if u_emb is not None:
+            terms.append(u_emb.norm(2, dim=-1).pow(2).mean())
+        reg = self.embedding_regularizer / 2.0 * sum(terms)
         return reg
 
     def _tokenize(self, user_ids, item_ids, item_vis,
                   pos_items, pos_lens, neg_items, neg_lens,
-                  pos_items_vis, neg_items_vis):
+                  pos_items_vis, neg_items_vis,
+                  cate_ids=None, pos_cates=None, neg_cates=None,
+                  extra_cat_ids=None, extra_seq_ids=None, extra_seq_lens=None,
+                  numeric_vals=None):
         """
         公共前处理 (与 BARS benchmark 对齐):
         embedding → vis_proj → DIN双通道序列编码(仅pos) → concat → pad → chunk → proj → [B, T, D]
@@ -167,29 +240,65 @@ class BaseCTR(nn.Module):
 
         Returns: (tokens [B, T, D], u_emb [B, E], i_emb [B, E])
         """
-        u_emb = self.user_emb(user_ids)       # [B, user_emb_dim]
+        u_emb = self.user_emb(user_ids) if self.use_user_feature else None
         i_emb = self.item_emb(item_ids)       # [B, item_emb_dim]
+        c_emb = self.cate_emb(cate_ids) if self.use_category else None
+        extra_cat_embs = self._extra_cat_embedding_dict(extra_cat_ids)
 
-        if self.use_pretrained:
+        seq_parts = []
+        target_parts = []
+        seq_mask = None
+        if self.use_item_sequence:
+            pos_id_emb = self.item_emb(pos_items)
+            seq_parts.append(pos_id_emb)
+            target_parts.append(i_emb)
+            seq_mask = torch.arange(pos_items.size(1), device=pos_items.device).unsqueeze(0) < pos_lens.unsqueeze(1)
+
+        if self.use_item_sequence and self.use_pretrained:
             # 投影 target item visual embedding
             item_vis_proj = self.vis_proj(item_vis)  # [B, vis_dim]
 
             # DIN: pos 双通道 (item_id_emb + item_vis_emb)
-            pos_id_emb = self.item_emb(pos_items)           # [B, S, item_emb_dim]
             pos_vis_proj = self.vis_proj(pos_items_vis)      # [B, S, vis_dim]
-            pos_seq_emb = torch.cat([pos_id_emb, pos_vis_proj], dim=-1)  # [B, S, seq_emb_dim]
-            target_seq = torch.cat([i_emb, item_vis_proj], dim=-1)       # [B, seq_emb_dim]
+            seq_parts.append(pos_vis_proj)
+            target_parts.append(item_vis_proj)
         else:
             item_vis_proj = None
-            pos_seq_emb = self.item_emb(pos_items)
-            target_seq = i_emb
 
-        pos_mask = torch.arange(pos_items.size(1), device=pos_items.device).unsqueeze(0) < pos_lens.unsqueeze(1)
-        pos_enc = self.pos_din_attn(pos_seq_emb, target_seq, pos_mask)  # [B, seq_emb_dim]
+        if self.use_category and pos_cates is not None and self.cfg_data_has_pos_cate:
+            seq_parts.append(self.cate_emb(pos_cates))
+            target_parts.append(c_emb)
+            if seq_mask is None:
+                seq_mask = torch.arange(pos_cates.size(1), device=pos_cates.device).unsqueeze(0) < pos_lens.unsqueeze(1)
 
-        parts = [u_emb, i_emb]
+        if self.extra_seq_configs:
+            for idx, seq_cfg in enumerate(self.extra_seq_configs):
+                ids = extra_seq_ids[:, idx, :]
+                lens = extra_seq_lens[:, idx]
+                seq_parts.append(self._lookup_shared_seq_embedding(seq_cfg["share_embedding"], ids))
+                target_parts.append(self._lookup_shared_target_embedding(
+                    seq_cfg["share_embedding"], i_emb, c_emb, extra_cat_embs,
+                ))
+                mask_i = torch.arange(ids.size(1), device=ids.device).unsqueeze(0) < lens.unsqueeze(1)
+                seq_mask = mask_i if seq_mask is None else (seq_mask | mask_i)
+
+        pos_seq_emb = torch.cat(seq_parts, dim=-1)
+        target_seq = torch.cat(target_parts, dim=-1)
+
+        pos_enc = self.pos_din_attn(pos_seq_emb, target_seq, seq_mask)  # [B, seq_emb_dim]
+
+        parts = []
+        if self.use_user_feature:
+            parts.append(u_emb)
+        parts.append(i_emb)
         if self.use_pretrained:
             parts.append(item_vis_proj)
+        if self.use_category:
+            parts.append(c_emb)
+        parts.extend(extra_cat_embs[name] for name in self.extra_cat_names)
+        if self.numeric_cols:
+            for idx, name in enumerate(self.numeric_cols):
+                parts.append(self.numeric_projs[name](numeric_vals[:, idx:idx + 1]))
         parts.append(pos_enc)
         e_input = torch.cat(parts, dim=-1)
 
@@ -254,10 +363,16 @@ class RankMixerCTR(BaseCTR):
 
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
-                pos_items_vis, neg_items_vis):
+                pos_items_vis, neg_items_vis,
+                cate_ids=None, pos_cates=None, neg_cates=None,
+                extra_cat_ids=None, extra_seq_ids=None, extra_seq_lens=None,
+                numeric_vals=None):
         x, u_emb, i_emb = self._tokenize(user_ids, item_ids, item_vis,
                            pos_items, pos_lens, neg_items, neg_lens,
-                           pos_items_vis, neg_items_vis)
+                           pos_items_vis, neg_items_vis,
+                            cate_ids, pos_cates, neg_cates,
+                            extra_cat_ids, extra_seq_ids, extra_seq_lens,
+                            numeric_vals)
 
         total_reg = torch.tensor(0.0, device=x.device)
         if self.mode == "dense":
@@ -503,7 +618,8 @@ class HSTUCTR(nn.Module):
         user_emb_dim = emb_cfg["user_emb_dim"]
         item_emb_dim = emb_cfg["item_emb_dim"]
         self.use_pretrained = data_cfg.get("use_pretrained_emb", True)
-        item_vis_dim = data_cfg["item_vis_dim"] if self.use_pretrained else 0
+        item_vis_dim = data_cfg.get("item_vis_dim", 0) if self.use_pretrained else 0
+        cate_emb_dim = emb_cfg.get("cate_emb_dim", item_emb_dim)
         hidden_dim = model_cfg["hidden_dim"]
         num_layers = model_cfg["num_layers"]
         num_heads = model_cfg["num_heads"]
@@ -766,7 +882,8 @@ class HyFormerCTR(BaseCTR):
         chunk_size = self.chunk_size
         user_emb_dim = emb_cfg["user_emb_dim"]
         item_emb_dim = emb_cfg["item_emb_dim"]
-        item_vis_dim = data_cfg["item_vis_dim"] if self.use_pretrained else 0
+        item_vis_dim = data_cfg.get("item_vis_dim", 0) if self.use_pretrained else 0
+        cate_emb_dim = emb_cfg.get("cate_emb_dim", item_emb_dim)
         seq_input_dim = item_emb_dim + item_vis_dim
 
         self._gradient_checkpointing = False
@@ -896,28 +1013,90 @@ class InterFormerCTR(BaseCTR):
         model_cfg = cfg["model"]
 
         hidden_dim = self.hidden_dim
-        chunk_size = self.chunk_size
         user_emb_dim = emb_cfg["user_emb_dim"]
         item_emb_dim = emb_cfg["item_emb_dim"]
-        item_vis_dim = data_cfg["item_vis_dim"] if self.use_pretrained else 0
-        seq_input_dim = item_emb_dim + item_vis_dim
+        cate_emb_dim = emb_cfg.get("cate_emb_dim", item_emb_dim)
+        numeric_emb_dim = emb_cfg.get("numeric_emb_dim", item_emb_dim)
+        item_vis_dim = data_cfg.get("item_vis_dim", 0) if self.use_pretrained else 0
 
         self._gradient_checkpointing = False
-        self.nonseq_dim = user_emb_dim + item_emb_dim + item_vis_dim
-        self.num_nonseq_tokens = math.ceil(self.nonseq_dim / chunk_size)
-        self.nonseq_padded_dim = self.num_nonseq_tokens * chunk_size
+        self.use_neg_sequence = model_cfg.get("use_neg_sequence", True)
+        self.num_nonseq_tokens = 1
+        if self.use_user_feature:
+            self.num_nonseq_tokens += 1
+        if self.use_pretrained:
+            self.num_nonseq_tokens += 1
+        if self.use_category:
+            self.num_nonseq_tokens += 1
+        self.num_nonseq_tokens += len(self.extra_cat_names)
+        self.num_nonseq_tokens += len(self.numeric_cols)
 
         num_layers = model_cfg["num_layers"]
         num_heads = model_cfg["num_heads"]
         ffn_expansion = model_cfg.get("ffn_expansion", 4)
         dropout = model_cfg.get("dropout", 0.0)
         num_nonseq_summary_tokens = model_cfg.get("num_nonseq_summary_tokens", 1)
+        num_cls_tokens = model_cfg.get("num_cls_tokens", 4)
         num_pma_tokens = model_cfg.get("num_pma_tokens", 2)
-        num_recent_tokens = model_cfg.get("num_recent_tokens", 1)
+        num_recent_tokens = model_cfg.get("num_recent_tokens", 2)
+        dhen_layers = model_cfg.get("dhen_layers", 3)
+        dcn_rank = model_cfg.get("dcn_rank", 32)
         max_seq_len = data_cfg.get("max_seq_len", 100)
 
-        self.seq_proj = nn.Linear(seq_input_dim, hidden_dim)
-        self.initial_cls = TokenSummaryGate(self.num_nonseq_tokens, 1, hidden_dim)
+        if self.use_user_feature:
+            self.user_token_proj = nn.Linear(user_emb_dim, hidden_dim)
+        self.item_token_proj = nn.Linear(item_emb_dim, hidden_dim)
+        if self.use_pretrained:
+            self.item_vis_token_proj = nn.Linear(item_vis_dim, hidden_dim)
+        if self.use_category:
+            self.cate_token_proj = nn.Linear(cate_emb_dim, hidden_dim)
+        self.extra_cat_token_proj = nn.ModuleDict({
+            name: nn.Linear(self.extra_cat_embs[name].embedding_dim, hidden_dim)
+            for name in self.extra_cat_names
+        })
+        self.numeric_token_proj = nn.ModuleDict({
+            name: nn.Linear(numeric_emb_dim, hidden_dim)
+            for name in self.numeric_cols
+        })
+
+        if self.use_item_sequence:
+            self.item_seq_proj = nn.Linear(item_emb_dim, hidden_dim)
+        if self.use_pretrained:
+            self.vis_seq_proj = nn.Linear(item_vis_dim, hidden_dim)
+        if self.use_category and self.cfg_data_has_pos_cate:
+            self.cate_seq_proj = nn.Linear(cate_emb_dim, hidden_dim)
+        self.extra_seq_proj = nn.ModuleDict()
+        for c in self.extra_seq_configs:
+            share = c["share_embedding"]
+            if share == "item_id":
+                in_dim = item_emb_dim
+            elif share == "cate_id":
+                in_dim = cate_emb_dim
+            else:
+                in_dim = self.extra_cat_embs[share].embedding_dim
+            self.extra_seq_proj[c["name"]] = nn.Linear(in_dim, hidden_dim)
+
+        fields_per_sequence = 0
+        if self.use_item_sequence:
+            fields_per_sequence += 1
+        if self.use_item_sequence and self.use_pretrained:
+            fields_per_sequence += 1
+        if self.use_category and self.cfg_data_has_pos_cate:
+            fields_per_sequence += 1
+        num_seq_fields = fields_per_sequence * (2 if self.use_neg_sequence else 1)
+        num_seq_fields += len(self.extra_seq_configs)
+        self.seq_mask_net = nn.Sequential(
+            nn.Linear(num_seq_fields * hidden_dim, num_seq_fields * hidden_dim),
+            nn.SiLU(),
+            nn.Linear(num_seq_fields * hidden_dim, num_seq_fields * hidden_dim),
+            nn.Sigmoid(),
+        )
+        self.seq_lce = nn.Linear(num_seq_fields * hidden_dim, hidden_dim)
+        self.initial_cls = TokenSummaryGate(
+            self.num_nonseq_tokens,
+            num_cls_tokens,
+            hidden_dim,
+        )
         self.blocks = nn.ModuleList([
             InterFormerBlock(
                 num_nonseq_tokens=self.num_nonseq_tokens,
@@ -927,8 +1106,11 @@ class InterFormerCTR(BaseCTR):
                 num_pma_tokens=num_pma_tokens,
                 num_recent_tokens=num_recent_tokens,
                 ffn_expansion=ffn_expansion,
+                dhen_layers=dhen_layers,
+                dcn_rank=dcn_rank,
                 dropout=dropout,
                 max_seq_len=max_seq_len,
+                num_cls_tokens=num_cls_tokens,
             )
             for _ in range(num_layers)
         ])
@@ -940,58 +1122,120 @@ class InterFormerCTR(BaseCTR):
             hidden_dim * 2, output_head_units, head_activation, head_dropout
         )
 
-        seq_summary_tokens = 1 + num_pma_tokens + num_recent_tokens
+        seq_summary_tokens = num_cls_tokens + num_pma_tokens + num_recent_tokens
         interaction_tokens = self.num_nonseq_tokens + seq_summary_tokens
-        print(f"  [InterFormer] NS dim: {self.nonseq_dim}, NS tokens: {self.num_nonseq_tokens}, "
+        print(f"  [InterFormer] NS tokens: {self.num_nonseq_tokens}, CLS tokens: {num_cls_tokens}, "
               f"Seq summary tokens: {seq_summary_tokens}, Interaction tokens: {interaction_tokens}")
         print(f"  Hidden (D): {hidden_dim}, Heads: {num_heads}, Layers: {num_layers}, "
-              f"PMA: {num_pma_tokens}, Recent: {num_recent_tokens}, FFN expansion: {ffn_expansion}")
+              f"PMA: {num_pma_tokens}, Recent: {num_recent_tokens}, "
+              f"DHEN layers: {dhen_layers}, FFN expansion: {ffn_expansion}")
 
     def enable_gradient_checkpointing(self):
         self._gradient_checkpointing = True
 
     def _tokenize_nonseq_and_seq(self, user_ids, item_ids, item_vis,
-                                 pos_items, pos_lens, pos_items_vis):
-        u_emb = self.user_emb(user_ids)
+                                 pos_items, pos_lens, neg_items, neg_lens,
+                                 pos_items_vis, neg_items_vis,
+                                 cate_ids=None, pos_cates=None, neg_cates=None,
+                                 extra_cat_ids=None, extra_seq_ids=None, extra_seq_lens=None,
+                                 numeric_vals=None):
+        u_emb = self.user_emb(user_ids) if self.use_user_feature else None
         i_emb = self.item_emb(item_ids)
+        c_emb = self.cate_emb(cate_ids) if self.use_category else None
+        extra_cat_embs = self._extra_cat_embedding_dict(extra_cat_ids)
 
-        if self.use_pretrained:
+        nonseq_tokens = []
+        if self.use_user_feature:
+            nonseq_tokens.append(self.user_token_proj(u_emb).unsqueeze(1))
+        nonseq_tokens.append(self.item_token_proj(i_emb).unsqueeze(1))
+        item_vis_proj = None
+        if self.use_item_sequence and self.use_pretrained:
             item_vis_proj = self.vis_proj(item_vis)
             pos_id_emb = self.item_emb(pos_items)
             pos_vis_proj = self.vis_proj(pos_items_vis)
-            seq_raw = torch.cat([pos_id_emb, pos_vis_proj], dim=-1)
-            nonseq_input = torch.cat([u_emb, i_emb, item_vis_proj], dim=-1)
-        else:
-            seq_raw = self.item_emb(pos_items)
-            nonseq_input = torch.cat([u_emb, i_emb], dim=-1)
+            neg_id_emb = self.item_emb(neg_items)
+            neg_vis_proj = self.vis_proj(neg_items_vis)
+            nonseq_tokens.append(self.item_vis_token_proj(item_vis_proj).unsqueeze(1))
+        elif self.use_item_sequence:
+            pos_id_emb = self.item_emb(pos_items)
+            neg_id_emb = self.item_emb(neg_items)
+        if self.use_category:
+            nonseq_tokens.append(self.cate_token_proj(c_emb).unsqueeze(1))
+            if self.cfg_data_has_pos_cate:
+                pos_cate_emb = self.cate_emb(pos_cates)
+                neg_cate_emb = self.cate_emb(neg_cates)
+        for name in self.extra_cat_names:
+            nonseq_tokens.append(self.extra_cat_token_proj[name](extra_cat_embs[name]).unsqueeze(1))
+        for idx, name in enumerate(self.numeric_cols):
+            num_emb = self.numeric_projs[name](numeric_vals[:, idx:idx + 1])
+            nonseq_tokens.append(self.numeric_token_proj[name](num_emb).unsqueeze(1))
+        nonseq_tokens = torch.cat(nonseq_tokens, dim=1)
 
-        B = nonseq_input.size(0)
-        if nonseq_input.size(-1) < self.nonseq_padded_dim:
-            nonseq_input = F.pad(
-                nonseq_input,
-                (0, self.nonseq_padded_dim - nonseq_input.size(-1)),
+        seq_fields = []
+        seq_mask = None
+        if self.use_item_sequence:
+            pos_mask = (
+                torch.arange(pos_items.size(1), device=pos_items.device).unsqueeze(0)
+                < pos_lens.unsqueeze(1)
             )
-        nonseq_chunks = nonseq_input.view(B, self.num_nonseq_tokens, self.chunk_size)
-        nonseq_tokens = self.proj(nonseq_chunks)
+            neg_mask = (
+                torch.arange(neg_items.size(1), device=neg_items.device).unsqueeze(0)
+                < neg_lens.unsqueeze(1)
+            )
+            seq_fields.append(self.item_seq_proj(pos_id_emb))
+            seq_mask = pos_mask
+        if self.use_item_sequence and self.use_pretrained:
+            seq_fields.append(self.vis_seq_proj(pos_vis_proj))
+        if self.use_category and self.cfg_data_has_pos_cate:
+            seq_fields.append(self.cate_seq_proj(pos_cate_emb))
+            if seq_mask is None:
+                seq_mask = torch.arange(pos_cates.size(1), device=pos_cates.device).unsqueeze(0) < pos_lens.unsqueeze(1)
+        if self.use_item_sequence and self.use_neg_sequence:
+            seq_fields.append(self.item_seq_proj(neg_id_emb))
+            seq_mask = seq_mask | neg_mask
+            if self.use_pretrained:
+                seq_fields.append(self.vis_seq_proj(neg_vis_proj))
+            if self.use_category and self.cfg_data_has_pos_cate:
+                seq_fields.append(self.cate_seq_proj(neg_cate_emb))
+        if self.extra_seq_configs:
+            for idx, seq_cfg in enumerate(self.extra_seq_configs):
+                ids = extra_seq_ids[:, idx, :]
+                lens = extra_seq_lens[:, idx]
+                seq_fields.append(
+                    self.extra_seq_proj[seq_cfg["name"]](
+                        self._lookup_shared_seq_embedding(seq_cfg["share_embedding"], ids)
+                    )
+                )
+                mask_i = torch.arange(ids.size(1), device=ids.device).unsqueeze(0) < lens.unsqueeze(1)
+                seq_mask = mask_i if seq_mask is None else (seq_mask | mask_i)
 
-        pos_mask = (
-            torch.arange(pos_items.size(1), device=pos_items.device).unsqueeze(0)
-            < pos_lens.unsqueeze(1)
-        )
-        seq_tokens = self.seq_proj(seq_raw)
-        seq_tokens = seq_tokens * pos_mask.unsqueeze(-1).to(seq_tokens.dtype)
+        seq_cat = torch.cat(seq_fields, dim=-1)
+        seq_tokens = self.seq_lce(seq_cat * self.seq_mask_net(seq_cat))
+        seq_tokens = seq_tokens * seq_mask.unsqueeze(-1).to(seq_tokens.dtype)
 
         cls_token = self.initial_cls(nonseq_tokens)
-        cls_mask = torch.ones(B, 1, dtype=torch.bool, device=pos_mask.device)
+        cls_mask = torch.ones(
+            nonseq_tokens.size(0),
+            cls_token.size(1),
+            dtype=torch.bool,
+            device=seq_mask.device,
+        )
         seq_tokens = torch.cat([cls_token, seq_tokens], dim=1)
-        seq_mask = torch.cat([cls_mask, pos_mask], dim=1)
+        seq_mask = torch.cat([cls_mask, seq_mask], dim=1)
         return nonseq_tokens, seq_tokens, seq_mask, u_emb, i_emb
 
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
-                pos_items_vis, neg_items_vis):
+                pos_items_vis, neg_items_vis,
+                cate_ids=None, pos_cates=None, neg_cates=None,
+                extra_cat_ids=None, extra_seq_ids=None, extra_seq_lens=None,
+                numeric_vals=None):
         nonseq_tokens, seq_tokens, seq_mask, u_emb, i_emb = self._tokenize_nonseq_and_seq(
-            user_ids, item_ids, item_vis, pos_items, pos_lens, pos_items_vis
+            user_ids, item_ids, item_vis,
+            pos_items, pos_lens, neg_items, neg_lens,
+            pos_items_vis, neg_items_vis,
+            cate_ids, pos_cates, neg_cates,
+            extra_cat_ids, extra_seq_ids, extra_seq_lens, numeric_vals,
         )
 
         for block in self.blocks:

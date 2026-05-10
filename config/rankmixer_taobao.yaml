@@ -1,38 +1,36 @@
 includes:
-  - ../data/datasets/kuaivideo.yaml
+  - ../data/datasets/taobao_ad.yaml
 
 model:
   arch: "rankmixer"
   mode: "dense"
   chunk_size: 20
-  hidden_dim: 1536
+  hidden_dim: 256
   num_layers: 2
   ffn_expansion: 4
   din_hidden_units: [512, 256]
-  output_head_units: [1024, 512, 256]
+  output_head_units: [512, 256, 128]
   head_activation: "Dice"
   head_dropout: 0.1
 training:
-  batch_size: 4096
-  learning_rate: 3.0e-4
+  batch_size: 8192
+  learning_rate: 1.0e-3
   weight_decay: 0.0
   num_epochs: 100
-  grad_clip_norm: 1.0
+  grad_clip_norm: 10.0
   optimizer: "adam"
   monitor: {"gAUC": 1, "AUC": 1}
   reduce_lr_on_plateau: true
   lr_decay_factor: 0.1
   scheduler_eta_min: 1.0e-6
-  warmup_steps: 1000
-  gradient_accumulation_steps: 8
-  gradient_checkpointing: true
   early_stop_patience: 2
 logging:
-  log_interval: 100
+  log_interval: 200
+  train_samples: 0
   eval_samples: 0
   save_best: true
-seed: 42
+seed: 20222023
 device: "auto"
 wandb:
   project: "rankmixer"
-  tags: ["rankmixer", "large", "kuaivideo", "bars_aligned"]
+  tags: ["rankmixer", "taobao", "bars_aligned"]
