@@ -1,0 +1,41 @@
+includes:
+  - ../data/datasets/kuaivideo.yaml
+
+model:
+  arch: "hyformer"
+  chunk_size: 20
+  hidden_dim: 768
+  num_layers: 2
+  num_heads: 12
+  num_query_tokens: 6
+  ffn_expansion: 4
+  seq_ffn_expansion: 2
+  dropout: 0.0
+  seq_encoder_type: "attention"
+  output_head_units: [1024, 512, 256]
+  head_activation: "Dice"
+  head_dropout: 0.1
+training:
+  batch_size: 4096
+  gradient_accumulation_steps: 8
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  num_epochs: 100
+  grad_clip_norm: 10.0
+  optimizer: "adam"
+  monitor: {"gAUC": 1, "AUC": 1}
+  reduce_lr_on_plateau: true
+  lr_decay_factor: 0.1
+  scheduler_eta_min: 1.0e-6
+  early_stop_patience: 2
+logging:
+  log_interval: 200
+  eval_samples: 0
+  save_best: true
+seed: 20222023
+device: "auto"
+wandb:
+  project: "rankmixer"
+  tags: ["hyformer", "kuaivideo", "bars_aligned"]
+
+# Attention sequence encoder smoke/full run with effective batch size 4096

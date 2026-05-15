@@ -872,7 +872,7 @@ class HyFormerCTR(BaseCTR):
 
     def __init__(self, cfg):
         super().__init__(cfg)
-        from .hyformer import HyFormerBlock, QueryGenerator
+        from .hyformer import MultiSequenceHyFormerBlock, MultiSequenceQueryGenerator
 
         data_cfg = cfg["data"]
         emb_cfg = cfg["embedding"]
@@ -886,24 +886,34 @@ class HyFormerCTR(BaseCTR):
         cate_emb_dim = emb_cfg.get("cate_emb_dim", item_emb_dim)
         numeric_emb_dim = emb_cfg.get("numeric_emb_dim", item_emb_dim)
 
-        seq_input_dim = 0
+        seq_input_dims = []
         if self.use_item_sequence:
-            seq_input_dim += item_emb_dim
-        if self.use_item_sequence and self.use_pretrained:
-            seq_input_dim += item_vis_dim
-        if self.use_category and self.cfg_data_has_pos_cate:
-            seq_input_dim += cate_emb_dim
+            item_seq_dim = item_emb_dim
+            if self.use_pretrained:
+                item_seq_dim += item_vis_dim
+            if self.use_category and self.cfg_data_has_pos_cate:
+                item_seq_dim += cate_emb_dim
+            seq_input_dims.append(item_seq_dim)
         for c in self.extra_seq_configs:
             share = c["share_embedding"]
             if share == "item_id":
-                seq_input_dim += item_emb_dim
+                seq_input_dims.append(item_emb_dim)
             elif share == "cate_id":
-                seq_input_dim += cate_emb_dim
+                seq_input_dims.append(cate_emb_dim)
             else:
-                seq_input_dim += self.extra_cat_embs[share].embedding_dim
+                seq_input_dims.append(self.extra_cat_embs[share].embedding_dim)
+        if not seq_input_dims:
+            # Keep the module buildable for purely non-sequential datasets.
+            seq_input_dims.append(item_emb_dim)
 
         self._gradient_checkpointing = False
-        self.num_query_tokens = model_cfg.get("num_query_tokens", 6)
+        requested_query_tokens = model_cfg.get("num_query_tokens", 6)
+        self.num_sequences = len(seq_input_dims)
+        self.query_tokens_per_sequence = model_cfg.get(
+            "query_tokens_per_sequence",
+            max(1, requested_query_tokens // self.num_sequences),
+        )
+        self.num_query_tokens = self.query_tokens_per_sequence * self.num_sequences
         self.nonseq_dim = item_emb_dim
         if self.use_user_feature:
             self.nonseq_dim += user_emb_dim
@@ -921,24 +931,31 @@ class HyFormerCTR(BaseCTR):
         ffn_expansion = model_cfg.get("ffn_expansion", 4)
         seq_ffn_expansion = model_cfg.get("seq_ffn_expansion", 2)
         dropout = model_cfg.get("dropout", 0.0)
+        seq_encoder_type = model_cfg.get("seq_encoder_type", "attention")
 
         # Reuse BaseCTR.proj for non-sequential chunk projection.
-        self.seq_proj = nn.Linear(seq_input_dim, hidden_dim)
-        self.query_generator = QueryGenerator(
+        self.seq_projs = nn.ModuleList([
+            nn.Linear(seq_input_dim, hidden_dim)
+            for seq_input_dim in seq_input_dims
+        ])
+        self.query_generator = MultiSequenceQueryGenerator(
             self.num_nonseq_tokens,
-            self.num_query_tokens,
+            self.num_sequences,
+            self.query_tokens_per_sequence,
             hidden_dim,
             dropout=dropout,
         )
         self.blocks = nn.ModuleList([
-            HyFormerBlock(
-                num_query_tokens=self.num_query_tokens,
+            MultiSequenceHyFormerBlock(
+                num_sequences=self.num_sequences,
+                query_tokens_per_sequence=self.query_tokens_per_sequence,
                 num_nonseq_tokens=self.num_nonseq_tokens,
                 hidden_dim=hidden_dim,
                 num_heads=num_heads,
                 ffn_expansion=ffn_expansion,
                 seq_ffn_expansion=seq_ffn_expansion,
                 dropout=dropout,
+                seq_encoder_type=seq_encoder_type,
             )
             for _ in range(num_layers)
         ])
@@ -946,15 +963,18 @@ class HyFormerCTR(BaseCTR):
         output_head_units = model_cfg.get("output_head_units", [1024, 512, 256])
         head_activation = model_cfg.get("head_activation", "Dice")
         head_dropout = model_cfg.get("head_dropout", 0.1)
+        self.output_fusion = nn.Linear(hidden_dim * 2, hidden_dim)
         self.output_head = _build_output_head(
             hidden_dim, output_head_units, head_activation, head_dropout
         )
 
         boost_tokens = self.num_query_tokens + self.num_nonseq_tokens
         print(f"  [HyFormer] NS dim: {self.nonseq_dim}, NS tokens: {self.num_nonseq_tokens}, "
-              f"Query tokens: {self.num_query_tokens}, Boost tokens: {boost_tokens}")
+              f"Sequences: {self.num_sequences}, Query tokens: {self.num_query_tokens} "
+              f"({self.query_tokens_per_sequence}/seq), Boost tokens: {boost_tokens}")
         print(f"  Hidden (D): {hidden_dim}, Heads: {num_heads}, Layers: {num_layers}, "
-              f"FFN expansion: {ffn_expansion}, Seq FFN expansion: {seq_ffn_expansion}")
+              f"FFN expansion: {ffn_expansion}, Seq FFN expansion: {seq_ffn_expansion}, "
+              f"Seq encoder: {seq_encoder_type}")
 
     def enable_gradient_checkpointing(self):
         self._gradient_checkpointing = True
@@ -975,12 +995,13 @@ class HyFormerCTR(BaseCTR):
             nonseq_parts.append(u_emb)
         nonseq_parts.append(i_emb)
 
-        seq_parts = []
-        seq_mask = None
+        seq_inputs = []
+        seq_masks = []
         if self.use_item_sequence:
+            item_seq_parts = []
             pos_id_emb = self.item_emb(pos_items)
-            seq_parts.append(pos_id_emb)
-            seq_mask = (
+            item_seq_parts.append(pos_id_emb)
+            item_seq_mask = (
                 torch.arange(pos_items.size(1), device=pos_items.device).unsqueeze(0)
                 < pos_lens.unsqueeze(1)
             )
@@ -988,15 +1009,17 @@ class HyFormerCTR(BaseCTR):
         if self.use_item_sequence and self.use_pretrained:
             item_vis_proj = self.vis_proj(item_vis)
             pos_vis_proj = self.vis_proj(pos_items_vis)
-            seq_parts.append(pos_vis_proj)
+            item_seq_parts.append(pos_vis_proj)
             nonseq_parts.append(item_vis_proj)
 
         if self.use_category:
             nonseq_parts.append(c_emb)
-            if self.cfg_data_has_pos_cate:
-                seq_parts.append(self.cate_emb(pos_cates))
-                if seq_mask is None:
-                    seq_mask = torch.arange(pos_cates.size(1), device=pos_cates.device).unsqueeze(0) < pos_lens.unsqueeze(1)
+            if self.use_item_sequence and self.cfg_data_has_pos_cate:
+                item_seq_parts.append(self.cate_emb(pos_cates))
+
+        if self.use_item_sequence:
+            seq_inputs.append(torch.cat(item_seq_parts, dim=-1))
+            seq_masks.append(item_seq_mask)
 
         for name in self.extra_cat_names:
             nonseq_parts.append(extra_cat_embs[name])
@@ -1007,12 +1030,16 @@ class HyFormerCTR(BaseCTR):
             for idx, seq_cfg in enumerate(self.extra_seq_configs):
                 ids = extra_seq_ids[:, idx, :]
                 lens = extra_seq_lens[:, idx]
-                seq_parts.append(self._lookup_shared_seq_embedding(seq_cfg["share_embedding"], ids))
+                seq_inputs.append(self._lookup_shared_seq_embedding(seq_cfg["share_embedding"], ids))
                 mask_i = torch.arange(ids.size(1), device=ids.device).unsqueeze(0) < lens.unsqueeze(1)
-                seq_mask = mask_i if seq_mask is None else (seq_mask | mask_i)
+                seq_masks.append(mask_i)
+
+        if not seq_inputs:
+            B = item_ids.size(0)
+            seq_inputs.append(i_emb.new_zeros(B, 1, i_emb.size(-1)))
+            seq_masks.append(torch.ones(B, 1, dtype=torch.bool, device=item_ids.device))
 
         nonseq_input = torch.cat(nonseq_parts, dim=-1)
-        seq_raw = torch.cat(seq_parts, dim=-1)
 
         B = nonseq_input.size(0)
         if nonseq_input.size(-1) < self.nonseq_padded_dim:
@@ -1023,9 +1050,12 @@ class HyFormerCTR(BaseCTR):
         nonseq_chunks = nonseq_input.view(B, self.num_nonseq_tokens, self.chunk_size)
         nonseq_tokens = self.proj(nonseq_chunks)
 
-        seq_tokens = self.seq_proj(seq_raw)
-        seq_tokens = seq_tokens * seq_mask.unsqueeze(-1).to(seq_tokens.dtype)
-        return nonseq_tokens, seq_tokens, seq_mask, u_emb, i_emb
+        seq_tokens_list = []
+        for seq_proj, seq_raw, seq_mask in zip(self.seq_projs, seq_inputs, seq_masks):
+            seq_tokens = seq_proj(seq_raw)
+            seq_tokens = seq_tokens * seq_mask.unsqueeze(-1).to(seq_tokens.dtype)
+            seq_tokens_list.append(seq_tokens)
+        return nonseq_tokens, seq_tokens_list, seq_masks, u_emb, i_emb
 
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
@@ -1033,7 +1063,7 @@ class HyFormerCTR(BaseCTR):
                 cate_ids=None, pos_cates=None, neg_cates=None,
                 extra_cat_ids=None, extra_seq_ids=None, extra_seq_lens=None,
                 numeric_vals=None):
-        nonseq_tokens, seq_tokens, seq_mask, u_emb, i_emb = self._tokenize_nonseq_and_seq(
+        nonseq_tokens, seq_tokens_list, seq_masks, u_emb, i_emb = self._tokenize_nonseq_and_seq(
             user_ids, item_ids, item_vis,
             pos_items, pos_lens, neg_items, neg_lens,
             pos_items_vis, neg_items_vis,
@@ -1041,19 +1071,25 @@ class HyFormerCTR(BaseCTR):
             extra_cat_ids, extra_seq_ids, extra_seq_lens, numeric_vals,
         )
 
-        queries = self.query_generator(nonseq_tokens, seq_tokens, seq_mask)
+        queries = self.query_generator(nonseq_tokens, seq_tokens_list, seq_masks)
         for block in self.blocks:
             if self._gradient_checkpointing and self.training:
-                queries, nonseq_tokens, seq_tokens = ckpt_fn(
-                    block, queries, nonseq_tokens, seq_tokens, seq_mask,
+                def _checkpoint_block(q, ns, *seqs):
+                    q, ns, out_seqs = block(q, ns, list(seqs), seq_masks)
+                    return (q, ns, *out_seqs)
+
+                out = ckpt_fn(
+                    _checkpoint_block, queries, nonseq_tokens, *seq_tokens_list,
                     use_reentrant=False,
                 )
+                queries, nonseq_tokens, *seq_tokens_list = out
             else:
-                queries, nonseq_tokens, seq_tokens = block(
-                    queries, nonseq_tokens, seq_tokens, seq_mask
+                queries, nonseq_tokens, seq_tokens_list = block(
+                    queries, nonseq_tokens, seq_tokens_list, seq_masks
                 )
 
-        logits = self.output_head(queries.mean(dim=1)).squeeze(-1)
+        pooled = torch.cat([queries.mean(dim=1), nonseq_tokens.mean(dim=1)], dim=-1)
+        logits = self.output_head(self.output_fusion(pooled)).squeeze(-1)
         reg_loss = self._get_embedding_reg_loss(u_emb, i_emb)
         return logits, reg_loss
 
