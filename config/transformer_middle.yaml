@@ -9,14 +9,28 @@
 
 # --- 数据配置 ---
 data:
+  dataset_id: "kuaivideo_x1"
   use_pretrained_emb: true
   data_dir: "KuaiVideo_x1"
+  cache_version: "bars_remap_v1"
+  seq_padding: "pre"
+  use_bars_feature_encoder: true
+  min_categr_count: 10
   train_file: "train.csv"
   test_file: "test.csv"
   item_emb_file: "item_visual_emb_dim64.h5"
-  num_users: 10000
+  user_col: "user_id"
+  item_col: "item_id"
+  label_col: "is_click"
+  cate_col: null
+  pos_item_col: "pos_items"
+  neg_item_col: "neg_items"
+  pos_cate_col: null
+  neg_cate_col: null
+  num_users: 10002
   num_items: 3242316
-  item_hash_size: 3250000
+  item_hash_size: 632406
+  raw_item_hash_size: 3242317
   item_vis_dim: 64
   max_seq_len: 100
   embedding_regularizer: 1.0e-4
@@ -29,7 +43,7 @@ embedding:
 # --- Transformer 模型配置 ---
 model:
   arch: "transformer"
-  chunk_size: 20                         # d → T = ceil(320/20) = 16
+  chunk_size: 28                         # d → T = ceil(320/20) = 16
   hidden_dim: 1024                       # D
   num_layers: 6                          # L
   num_heads: 16                          # H (head_dim = 64)

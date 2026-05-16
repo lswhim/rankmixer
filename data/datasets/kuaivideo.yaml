@@ -3,6 +3,7 @@ data:
   use_pretrained_emb: true
   data_dir: "KuaiVideo_x1"
   cache_version: "bars_remap_v1"
+  seq_padding: "pre"
   use_bars_feature_encoder: true
   min_categr_count: 10
   train_file: "train.csv"

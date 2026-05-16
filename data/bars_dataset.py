@@ -43,7 +43,9 @@ def load_pretrained_embeddings(cfg):
     return item_emb_table
 
 
-def _parse_seq_column(series, vocab_size, max_seq_len, value_map=None):
+def _parse_seq_column(series, vocab_size, max_seq_len, value_map=None, padding="post"):
+    if padding not in {"pre", "post"}:
+        raise ValueError(f"Unsupported seq padding: {padding}")
     ids_arr = np.zeros((len(series), max_seq_len), dtype=np.int32)
     lens_arr = np.zeros(len(series), dtype=np.int32)
     for i, val in enumerate(series):
@@ -57,7 +59,10 @@ def _parse_seq_column(series, vocab_size, max_seq_len, value_map=None):
             oov_idx = int(value_map["oov_idx"])
             seq = [mapping.get(int(x), oov_idx) for x in parts]
         seq = seq[-max_seq_len:]
-        ids_arr[i, :len(seq)] = seq
+        if padding == "pre":
+            ids_arr[i, -len(seq):] = seq
+        else:
+            ids_arr[i, :len(seq)] = seq
         lens_arr[i] = len(seq)
     return ids_arr, lens_arr
 
@@ -187,6 +192,7 @@ def _preprocess_csv_to_cache(csv_path, cache_path, cfg, feature_maps=None, max_s
     item_hash_size = data_cfg["item_hash_size"]
     num_categories = data_cfg.get("num_categories", 0)
     max_seq_len = data_cfg.get("max_seq_len", 100)
+    seq_padding = data_cfg.get("seq_padding", "post")
     user_col = data_cfg.get("user_col", "user_id")
     item_col = data_cfg.get("item_col", "item_id")
     label_col = data_cfg.get("label_col", "is_click")
@@ -234,8 +240,8 @@ def _preprocess_csv_to_cache(csv_path, cache_path, cfg, feature_maps=None, max_s
     if pos_item_col:
         if is_main_process():
             print(f"    解析 {pos_item_col} 序列 ...")
-        raw_pos_ids, _ = _parse_seq_column(df[pos_item_col], raw_item_hash_size, max_seq_len)
-        pos_ids, pos_lens = _parse_seq_column(df[pos_item_col], item_hash_size, max_seq_len, item_map)
+        raw_pos_ids, _ = _parse_seq_column(df[pos_item_col], raw_item_hash_size, max_seq_len, padding=seq_padding)
+        pos_ids, pos_lens = _parse_seq_column(df[pos_item_col], item_hash_size, max_seq_len, item_map, padding=seq_padding)
     else:
         raw_pos_ids = np.zeros((len(df), max_seq_len), dtype=np.int32)
         pos_ids = np.zeros_like(raw_pos_ids)
@@ -244,8 +250,8 @@ def _preprocess_csv_to_cache(csv_path, cache_path, cfg, feature_maps=None, max_s
     if neg_item_col:
         if is_main_process():
             print(f"    解析 {neg_item_col} 序列 ...")
-        raw_neg_ids, _ = _parse_seq_column(df[neg_item_col], raw_item_hash_size, max_seq_len)
-        neg_ids, neg_lens = _parse_seq_column(df[neg_item_col], item_hash_size, max_seq_len, item_map)
+        raw_neg_ids, _ = _parse_seq_column(df[neg_item_col], raw_item_hash_size, max_seq_len, padding=seq_padding)
+        neg_ids, neg_lens = _parse_seq_column(df[neg_item_col], item_hash_size, max_seq_len, item_map, padding=seq_padding)
     else:
         raw_neg_ids = np.zeros_like(raw_pos_ids)
         neg_ids = np.zeros_like(pos_ids)
@@ -254,14 +260,14 @@ def _preprocess_csv_to_cache(csv_path, cache_path, cfg, feature_maps=None, max_s
     if pos_cate_col and num_categories > 0:
         if is_main_process():
             print(f"    解析 {pos_cate_col} 序列 ...")
-        pos_cates, _ = _parse_seq_column(df[pos_cate_col], num_categories, max_seq_len, cate_map)
+        pos_cates, _ = _parse_seq_column(df[pos_cate_col], num_categories, max_seq_len, cate_map, padding=seq_padding)
     else:
         pos_cates = np.zeros_like(pos_ids)
 
     if neg_cate_col and num_categories > 0:
         if is_main_process():
             print(f"    解析 {neg_cate_col} 序列 ...")
-        neg_cates, _ = _parse_seq_column(df[neg_cate_col], num_categories, max_seq_len, cate_map)
+        neg_cates, _ = _parse_seq_column(df[neg_cate_col], num_categories, max_seq_len, cate_map, padding=seq_padding)
     else:
         neg_cates = np.zeros_like(neg_ids)
 
@@ -287,6 +293,7 @@ def _preprocess_csv_to_cache(csv_path, cache_path, cfg, feature_maps=None, max_s
             int(c["vocab_size"]),
             max_seq_len,
             feature_maps.get(c["share_embedding"]) if feature_maps else None,
+            padding=seq_padding,
         )
         extra_seq_ids.append(ids)
         extra_seq_lens.append(lens)
@@ -340,13 +347,14 @@ class CTRMapDataset(torch.utils.data.Dataset):
 
     def __init__(self, csv_path, item_vis_emb, cfg, max_samples=None):
         max_seq_len = cfg["data"].get("max_seq_len", 100)
+        seq_padding = cfg["data"].get("seq_padding", "post")
         data_dir = os.path.dirname(csv_path)
         feature_maps = _build_or_load_feature_maps(cfg, data_dir)
 
         base = os.path.splitext(csv_path)[0]
         cache_version = cfg["data"].get("cache_version", "v1")
         suffix = f"_n{max_samples}" if max_samples else ""
-        cache_path = f"{base}_cache_{cache_version}_seq{max_seq_len}{suffix}"
+        cache_path = f"{base}_cache_{cache_version}_seq{max_seq_len}_pad{seq_padding}{suffix}"
         cache_file = cache_path + ".npz"
 
         if os.path.exists(cache_file):

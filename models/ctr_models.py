@@ -16,6 +16,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Tuple, List, Optional
 from torch.utils.checkpoint import checkpoint as ckpt_fn
 
 from .rankmixer import (
@@ -36,6 +37,15 @@ def _build_output_head(input_dim, hidden_units, activation="Dice", dropout=0.1):
                  dropout_rate=dropout),
         nn.Linear(hidden_units[-1], 1),
     )
+
+
+def _valid_seq_mask(seq_ids, seq_lens=None):
+    """Sequence padding in FuxiCTR/BARS can be pre or post; ids==0 is padding."""
+    mask = seq_ids.ne(0)
+    if seq_lens is not None:
+        has_len = seq_lens.gt(0).unsqueeze(1)
+        mask = mask & has_len
+    return mask
 
 
 # ============================================================
@@ -115,7 +125,9 @@ class BaseCTR(nn.Module):
         item_vis_dim = data_cfg.get("item_vis_dim", 0) if self.use_pretrained else 0
         self.use_category = data_cfg.get("num_categories", 0) > 0
         self.use_item_sequence = data_cfg.get("pos_item_col", "pos_items") is not None
+        self.use_neg_sequence = data_cfg.get("neg_item_col") is not None
         self.cfg_data_has_pos_cate = data_cfg.get("pos_cate_col") is not None
+        self.cfg_data_has_neg_cate = data_cfg.get("neg_cate_col") is not None
         cate_emb_dim = emb_cfg.get("cate_emb_dim", item_emb_dim)
         extra_cat_emb_dim = emb_cfg.get("extra_cat_emb_dim", item_emb_dim)
         numeric_emb_dim = emb_cfg.get("numeric_emb_dim", item_emb_dim)
@@ -172,9 +184,12 @@ class BaseCTR(nn.Module):
                 seq_emb_dim += self.extra_cat_embs[share].embedding_dim
         din_hidden_units = model_cfg.get("din_hidden_units", [256, 128])
         self.pos_din_attn = DINAttention(seq_emb_dim, hidden_units=din_hidden_units)
+        if self.use_neg_sequence:
+            self.neg_din_attn = DINAttention(seq_emb_dim, hidden_units=din_hidden_units)
 
-        # total_dim: optional user_emb + item_emb + optional item_vis/category + pos_seq_enc
-        total_dim = item_emb_dim + seq_emb_dim
+        # total_dim: BARS-style globals + positive sequence interest + optional negative interest
+        num_behavior_interests = 1 + int(self.use_neg_sequence)
+        total_dim = item_emb_dim + seq_emb_dim * num_behavior_interests
         if self.use_user_feature:
             total_dim += user_emb_dim
         if self.use_pretrained:
@@ -190,6 +205,9 @@ class BaseCTR(nn.Module):
         self.total_dim = total_dim
 
         self.proj = nn.Linear(chunk_size, hidden_dim)
+
+        # 可学习维度排列 (可选)
+        self.dim_permute = None  # 子类可设置
 
     def _extra_cat_embedding_dict(self, extra_cat_ids):
         if not self.extra_cat_names:
@@ -235,8 +253,8 @@ class BaseCTR(nn.Module):
                   numeric_vals=None):
         """
         公共前处理 (与 BARS benchmark 对齐):
-        embedding → vis_proj → DIN双通道序列编码(仅pos) → concat → pad → chunk → proj → [B, T, D]
-        neg 序列不参与建模 (与 BARS benchmark 所有模型一致)
+        embedding → vis_proj → DIN target attention over pos/neg behavior fields
+        → concat → pad → chunk → proj → [B, T, D]
 
         Returns: (tokens [B, T, D], u_emb [B, E], i_emb [B, E])
         """
@@ -245,47 +263,64 @@ class BaseCTR(nn.Module):
         c_emb = self.cate_emb(cate_ids) if self.use_category else None
         extra_cat_embs = self._extra_cat_embedding_dict(extra_cat_ids)
 
-        seq_parts = []
+        pos_seq_parts = []
+        neg_seq_parts = []
         target_parts = []
-        seq_mask = None
+        pos_seq_mask = None
+        neg_seq_mask = None
         if self.use_item_sequence:
             pos_id_emb = self.item_emb(pos_items)
-            seq_parts.append(pos_id_emb)
+            pos_seq_parts.append(pos_id_emb)
             target_parts.append(i_emb)
-            seq_mask = torch.arange(pos_items.size(1), device=pos_items.device).unsqueeze(0) < pos_lens.unsqueeze(1)
+            pos_seq_mask = _valid_seq_mask(pos_items, pos_lens)
+            if self.use_neg_sequence:
+                neg_id_emb = self.item_emb(neg_items)
+                neg_seq_parts.append(neg_id_emb)
+                neg_seq_mask = _valid_seq_mask(neg_items, neg_lens)
 
         if self.use_item_sequence and self.use_pretrained:
             # 投影 target item visual embedding
             item_vis_proj = self.vis_proj(item_vis)  # [B, vis_dim]
 
-            # DIN: pos 双通道 (item_id_emb + item_vis_emb)
+            # DIN: BARS 双通道 (item_id_emb + item_vis_emb)
             pos_vis_proj = self.vis_proj(pos_items_vis)      # [B, S, vis_dim]
-            seq_parts.append(pos_vis_proj)
+            pos_seq_parts.append(pos_vis_proj)
             target_parts.append(item_vis_proj)
+            if self.use_neg_sequence:
+                neg_vis_proj = self.vis_proj(neg_items_vis)
+                neg_seq_parts.append(neg_vis_proj)
         else:
             item_vis_proj = None
 
         if self.use_category and pos_cates is not None and self.cfg_data_has_pos_cate:
-            seq_parts.append(self.cate_emb(pos_cates))
+            pos_seq_parts.append(self.cate_emb(pos_cates))
             target_parts.append(c_emb)
-            if seq_mask is None:
-                seq_mask = torch.arange(pos_cates.size(1), device=pos_cates.device).unsqueeze(0) < pos_lens.unsqueeze(1)
+            if pos_seq_mask is None:
+                pos_seq_mask = _valid_seq_mask(pos_cates, pos_lens)
+            if self.use_neg_sequence and self.cfg_data_has_neg_cate:
+                neg_seq_parts.append(self.cate_emb(neg_cates))
+                if neg_seq_mask is None:
+                    neg_seq_mask = _valid_seq_mask(neg_cates, neg_lens)
 
         if self.extra_seq_configs:
             for idx, seq_cfg in enumerate(self.extra_seq_configs):
                 ids = extra_seq_ids[:, idx, :]
                 lens = extra_seq_lens[:, idx]
-                seq_parts.append(self._lookup_shared_seq_embedding(seq_cfg["share_embedding"], ids))
+                pos_seq_parts.append(self._lookup_shared_seq_embedding(seq_cfg["share_embedding"], ids))
                 target_parts.append(self._lookup_shared_target_embedding(
                     seq_cfg["share_embedding"], i_emb, c_emb, extra_cat_embs,
                 ))
-                mask_i = torch.arange(ids.size(1), device=ids.device).unsqueeze(0) < lens.unsqueeze(1)
-                seq_mask = mask_i if seq_mask is None else (seq_mask | mask_i)
+                mask_i = _valid_seq_mask(ids, lens)
+                pos_seq_mask = mask_i if pos_seq_mask is None else (pos_seq_mask | mask_i)
 
-        pos_seq_emb = torch.cat(seq_parts, dim=-1)
+        pos_seq_emb = torch.cat(pos_seq_parts, dim=-1)
         target_seq = torch.cat(target_parts, dim=-1)
 
-        pos_enc = self.pos_din_attn(pos_seq_emb, target_seq, seq_mask)  # [B, seq_emb_dim]
+        pos_enc = self.pos_din_attn(pos_seq_emb, target_seq, pos_seq_mask)  # [B, seq_emb_dim]
+        neg_enc = None
+        if self.use_neg_sequence:
+            neg_seq_emb = torch.cat(neg_seq_parts, dim=-1)
+            neg_enc = self.neg_din_attn(neg_seq_emb, target_seq, neg_seq_mask)
 
         parts = []
         if self.use_user_feature:
@@ -300,14 +335,24 @@ class BaseCTR(nn.Module):
             for idx, name in enumerate(self.numeric_cols):
                 parts.append(self.numeric_projs[name](numeric_vals[:, idx:idx + 1]))
         parts.append(pos_enc)
+        if neg_enc is not None:
+            parts.append(neg_enc)
         e_input = torch.cat(parts, dim=-1)
 
         B = e_input.size(0)
         if e_input.size(-1) < self.padded_dim:
             e_input = F.pad(e_input, (0, self.padded_dim - e_input.size(-1)))
 
+        e_input, permute_reg = self._apply_dim_permute(e_input)
+
         tokens = e_input.view(B, self.num_tokens, self.chunk_size)
-        return self.proj(tokens), u_emb, i_emb  # [B, T, D], [B, E], [B, E]
+        return self.proj(tokens), u_emb, i_emb, permute_reg  # [B, T, D], [B, E], [B, E], reg
+
+    def _apply_dim_permute(self, e_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """应用可学习维度排列 (如果启用). Returns: (e_permuted, reg_loss)"""
+        if self.dim_permute is not None:
+            return self.dim_permute(e_input)
+        return e_input, torch.tensor(0.0, device=e_input.device)
 
 
 # ============================================================
@@ -317,10 +362,34 @@ class BaseCTR(nn.Module):
 class RankMixerCTR(BaseCTR):
     def __init__(self, cfg):
         super().__init__(cfg)
+        self._cfg = cfg  # 保存原始配置
         model_cfg = cfg["model"]
         T = self.num_tokens
         hidden_dim = self.hidden_dim
         self._gradient_checkpointing = False
+
+        # 可学习维度混合 (可选, 替代固定 chunk 切分)
+        learnable_tok = model_cfg.get("learnable_tokenize", False)
+        if learnable_tok:
+            from .rankmixer import LearnableDimMix
+            tok_cfg = model_cfg.get("learnable_tokenize_cfg", {})
+            # 计算域偏移: 用于域感知初始化
+            field_offsets = self._compute_field_offsets()
+            self.dim_permute = LearnableDimMix(
+                dim=self.padded_dim,
+                rank=tok_cfg.get("rank", 32),
+                alpha_init=tok_cfg.get("alpha_init", 0.1),
+                scale=tok_cfg.get("scale", 0.01),
+                reg_weight=tok_cfg.get("reg_weight", 1e-4),
+                field_offsets=field_offsets,
+                field_bonus=tok_cfg.get("field_bonus", 0.1),
+            )
+            print(f"  Learnable dim mix: ON (D={self.padded_dim}, "
+                  f"rank={tok_cfg.get('rank', 32)}, "
+                  f"params={2 * self.padded_dim * tok_cfg.get('rank', 32) + 1}, "
+                  f"α_init={tok_cfg.get('alpha_init', 0.1)})")
+        else:
+            self.dim_permute = None
 
         # mode 二选一: "dense" 或 "moe"
         mode = model_cfg.get("mode", "dense").lower()
@@ -361,20 +430,59 @@ class RankMixerCTR(BaseCTR):
     def enable_gradient_checkpointing(self):
         self._gradient_checkpointing = True
 
+    def _compute_field_offsets(self):
+        """
+        计算各特征域在拼接向量中的 (start, end) 偏移.
+        必须和 _tokenize() 中 parts 的构建顺序一致.
+        用于 LearnableDimMix 的域感知初始化.
+        """
+        emb_cfg = self._cfg["embedding"]
+        data_cfg = self._cfg["data"]
+        user_emb_dim = emb_cfg["user_emb_dim"]
+        item_emb_dim = emb_cfg["item_emb_dim"]
+        item_vis_dim = data_cfg.get("item_vis_dim", 0) if self.use_pretrained else 0
+        cate_emb_dim = emb_cfg.get("cate_emb_dim", item_emb_dim)
+        extra_cat_emb_dim = emb_cfg.get("extra_cat_emb_dim", item_emb_dim)
+        numeric_emb_dim = emb_cfg.get("numeric_emb_dim", item_emb_dim)
+
+        offsets = []
+        offset = 0
+        if self.use_user_feature:
+            offsets.append((offset, offset + user_emb_dim))
+            offset += user_emb_dim
+        offsets.append((offset, offset + item_emb_dim))
+        offset += item_emb_dim
+        if self.use_pretrained:
+            offsets.append((offset, offset + item_vis_dim))
+            offset += item_vis_dim
+        if self.use_category:
+            offsets.append((offset, offset + cate_emb_dim))
+            offset += cate_emb_dim
+        for name in self.extra_cat_names:
+            d = self.extra_cat_embs[name].embedding_dim
+            offsets.append((offset, offset + d))
+            offset += d
+        for name in self.numeric_cols:
+            offsets.append((offset, offset + numeric_emb_dim))
+            offset += numeric_emb_dim
+        # 序列编码 (DIN 输出)
+        offsets.append((offset, self.total_dim))
+        return offsets
+
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
                 pos_items_vis, neg_items_vis,
                 cate_ids=None, pos_cates=None, neg_cates=None,
                 extra_cat_ids=None, extra_seq_ids=None, extra_seq_lens=None,
                 numeric_vals=None):
-        x, u_emb, i_emb = self._tokenize(user_ids, item_ids, item_vis,
+        x, u_emb, i_emb, permute_reg = self._tokenize(user_ids, item_ids, item_vis,
                            pos_items, pos_lens, neg_items, neg_lens,
                            pos_items_vis, neg_items_vis,
                             cate_ids, pos_cates, neg_cates,
                             extra_cat_ids, extra_seq_ids, extra_seq_lens,
                             numeric_vals)
 
-        total_reg = torch.tensor(0.0, device=x.device)
+        total_reg = torch.tensor(0.0, device=x.device) + permute_reg
         if self.mode == "dense":
             for blk in self.blocks:
                 if self._gradient_checkpointing and self.training:
@@ -470,10 +578,16 @@ class TokenMixerLargeCTR(BaseCTR):
 
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
-                pos_items_vis, neg_items_vis):
-        tokens, u_emb, i_emb = self._tokenize(user_ids, item_ids, item_vis,
+                pos_items_vis, neg_items_vis,
+                cate_ids=None, pos_cates=None, neg_cates=None,
+                extra_cat_ids=None, extra_seq_ids=None, extra_seq_lens=None,
+                numeric_vals=None):
+        tokens, u_emb, i_emb, _ = self._tokenize(user_ids, item_ids, item_vis,
                                 pos_items, pos_lens, neg_items, neg_lens,
-                                pos_items_vis, neg_items_vis)
+                                pos_items_vis, neg_items_vis,
+                                cate_ids, pos_cates, neg_cates,
+                                extra_cat_ids, extra_seq_ids, extra_seq_lens,
+                                numeric_vals)
         B = tokens.size(0)
 
         global_t = self.global_token.expand(B, -1, -1)
@@ -570,10 +684,16 @@ class TransformerCTR(BaseCTR):
 
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
-                pos_items_vis, neg_items_vis):
-        x, u_emb, i_emb = self._tokenize(user_ids, item_ids, item_vis,
+                pos_items_vis, neg_items_vis,
+                cate_ids=None, pos_cates=None, neg_cates=None,
+                extra_cat_ids=None, extra_seq_ids=None, extra_seq_lens=None,
+                numeric_vals=None):
+        x, u_emb, i_emb, _ = self._tokenize(user_ids, item_ids, item_vis,
                            pos_items, pos_lens, neg_items, neg_lens,
-                           pos_items_vis, neg_items_vis)
+                           pos_items_vis, neg_items_vis,
+                           cate_ids, pos_cates, neg_cates,
+                           extra_cat_ids, extra_seq_ids, extra_seq_lens,
+                           numeric_vals)
         for layer in self.layers:
             if self._gradient_checkpointing and self.training:
                 x = ckpt_fn(layer, x, use_reentrant=False)
@@ -654,9 +774,8 @@ class HSTUCTR(nn.Module):
         # 投影层: user prefix token (user_emb → hidden_dim, 无 is_like/is_follow)
         self.user_proj = nn.Linear(user_emb_dim, hidden_dim)
 
-        # 序列最长: 1 (user prefix) + max_seq_len * 2 (pos content+action) + 1 (target)
-        # 与 BARS benchmark 对齐: neg 序列不参与建模
-        max_tokens = 1 + max_seq_len * 2 + 1 + 8  # 留余量
+        # 序列最长: user prefix + pos/neg content-action pairs + target
+        max_tokens = 1 + max_seq_len * 4 + 1 + 8  # 留余量
         self.max_seq_len = max_seq_len
 
         print(f"  [HSTU] Hidden (D): {hidden_dim}, Heads: {num_heads}, "
@@ -699,11 +818,14 @@ class HSTUCTR(nn.Module):
 
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
-                pos_items_vis, neg_items_vis):
+                pos_items_vis, neg_items_vis,
+                cate_ids=None, pos_cates=None, neg_cates=None,
+                extra_cat_ids=None, extra_seq_ids=None, extra_seq_lens=None,
+                numeric_vals=None):
         """
         构造 Content-Action 交替序列并通过 HSTU Layers。
-        与 BARS benchmark 对齐: 只使用 pos 序列, neg 序列不参与建模。
-        序列: [user_prefix, pos_Φ_0, pos_a_0, ..., Φ_target]
+        BARS-style: 同时使用 pos_items/neg_items 及其 visual embeddings。
+        序列: [user_prefix, pos_Φ/a..., neg_Φ/a..., Φ_target]
         取最后一个 token (target content) 的输出做预测。
         """
         B = user_ids.size(0)
@@ -725,6 +847,17 @@ class HSTUCTR(nn.Module):
         pos_action_ids = torch.zeros(B, S, dtype=torch.long, device=device)
         pos_action_tokens = self.action_proj(self.action_emb(pos_action_ids))  # [B, S, D]
 
+        neg_item_emb = self.item_emb(neg_items)
+        if self.use_pretrained:
+            neg_vis_proj = self.vis_proj(neg_items_vis)
+            neg_content_input = torch.cat([neg_item_emb, neg_vis_proj], dim=-1)
+        else:
+            neg_content_input = neg_item_emb
+        neg_content_tokens = self.content_proj(neg_content_input)
+
+        neg_action_ids = torch.full((B, S), 3, dtype=torch.long, device=device)
+        neg_action_tokens = self.action_proj(self.action_emb(neg_action_ids))
+
         i_emb = self.item_emb(item_ids)                            # [B, item_emb_dim]
         if self.use_pretrained:
             target_vis = self.vis_proj(item_vis)                   # [B, vis_dim]
@@ -732,22 +865,29 @@ class HSTUCTR(nn.Module):
         else:
             target_token = self.content_proj(i_emb)
 
-        # --- 构造交替序列 (仅 pos) ---
+        # --- 构造交替序列 (pos + neg) ---
         pos_interleaved = torch.stack([pos_content_tokens, pos_action_tokens], dim=2)
         pos_interleaved = pos_interleaved.view(B, S * 2, self.hidden_dim)
+        neg_interleaved = torch.stack([neg_content_tokens, neg_action_tokens], dim=2)
+        neg_interleaved = neg_interleaved.view(B, S * 2, self.hidden_dim)
 
         full_seq = torch.cat([
             user_token.unsqueeze(1),       # [B, 1, D]
             pos_interleaved,               # [B, 2S, D]
+            neg_interleaved,               # [B, 2S, D]
             target_token.unsqueeze(1),     # [B, 1, D]
-        ], dim=1)  # [B, 2S+2, D]
+        ], dim=1)  # [B, 4S+2, D]
 
         # --- 构造 attention mask ---
-        valid_lens = 1 + pos_lens * 2 + 1  # [B]
         total_len = full_seq.size(1)       # 2S+2
-
-        pos_indices = torch.arange(total_len, device=device).unsqueeze(0)
-        padding_mask = pos_indices < valid_lens.unsqueeze(1)
+        pos_pair_mask = _valid_seq_mask(pos_items, pos_lens)
+        neg_pair_mask = _valid_seq_mask(neg_items, neg_lens)
+        padding_mask = torch.cat([
+            torch.ones(B, 1, dtype=torch.bool, device=device),
+            pos_pair_mask.unsqueeze(-1).expand(B, S, 2).reshape(B, S * 2),
+            neg_pair_mask.unsqueeze(-1).expand(B, S, 2).reshape(B, S * 2),
+            torch.ones(B, 1, dtype=torch.bool, device=device),
+        ], dim=1)
 
         attn_mask = padding_mask.unsqueeze(1).unsqueeze(2)
         attn_mask = attn_mask.expand(B, 1, total_len, total_len)
@@ -761,7 +901,7 @@ class HSTUCTR(nn.Module):
                 x = layer(x, attn_mask=attn_mask)
 
         # --- 取 target 位置的输出 ---
-        target_idx = (valid_lens - 1).unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
+        target_idx = torch.full((B, 1, 1), total_len - 1, dtype=torch.long, device=device)
         target_idx = target_idx.expand(B, 1, self.hidden_dim)     # [B, 1, D]
         target_hidden = x.gather(1, target_idx).squeeze(1)         # [B, D]
 
@@ -838,10 +978,16 @@ class HiFormerCTR(BaseCTR):
 
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
-                pos_items_vis, neg_items_vis):
-        x, u_emb, i_emb = self._tokenize(user_ids, item_ids, item_vis,
+                pos_items_vis, neg_items_vis,
+                cate_ids=None, pos_cates=None, neg_cates=None,
+                extra_cat_ids=None, extra_seq_ids=None, extra_seq_lens=None,
+                numeric_vals=None):
+        x, u_emb, i_emb, _ = self._tokenize(user_ids, item_ids, item_vis,
                            pos_items, pos_lens, neg_items, neg_lens,
-                           pos_items_vis, neg_items_vis)
+                           pos_items_vis, neg_items_vis,
+                           cate_ids, pos_cates, neg_cates,
+                           extra_cat_ids, extra_seq_ids, extra_seq_lens,
+                           numeric_vals)
 
         for layer in self.layers:
             if self._gradient_checkpointing and self.training:
@@ -894,6 +1040,13 @@ class HyFormerCTR(BaseCTR):
             if self.use_category and self.cfg_data_has_pos_cate:
                 item_seq_dim += cate_emb_dim
             seq_input_dims.append(item_seq_dim)
+            if self.use_neg_sequence:
+                neg_item_seq_dim = item_emb_dim
+                if self.use_pretrained:
+                    neg_item_seq_dim += item_vis_dim
+                if self.use_category and self.cfg_data_has_neg_cate:
+                    neg_item_seq_dim += cate_emb_dim
+                seq_input_dims.append(neg_item_seq_dim)
         for c in self.extra_seq_configs:
             share = c["share_embedding"]
             if share == "item_id":
@@ -1001,25 +1154,35 @@ class HyFormerCTR(BaseCTR):
             item_seq_parts = []
             pos_id_emb = self.item_emb(pos_items)
             item_seq_parts.append(pos_id_emb)
-            item_seq_mask = (
-                torch.arange(pos_items.size(1), device=pos_items.device).unsqueeze(0)
-                < pos_lens.unsqueeze(1)
-            )
+            item_seq_mask = _valid_seq_mask(pos_items, pos_lens)
+            if self.use_neg_sequence:
+                neg_item_seq_parts = []
+                neg_id_emb = self.item_emb(neg_items)
+                neg_item_seq_parts.append(neg_id_emb)
+                neg_item_seq_mask = _valid_seq_mask(neg_items, neg_lens)
 
         if self.use_item_sequence and self.use_pretrained:
             item_vis_proj = self.vis_proj(item_vis)
             pos_vis_proj = self.vis_proj(pos_items_vis)
             item_seq_parts.append(pos_vis_proj)
             nonseq_parts.append(item_vis_proj)
+            if self.use_neg_sequence:
+                neg_vis_proj = self.vis_proj(neg_items_vis)
+                neg_item_seq_parts.append(neg_vis_proj)
 
         if self.use_category:
             nonseq_parts.append(c_emb)
             if self.use_item_sequence and self.cfg_data_has_pos_cate:
                 item_seq_parts.append(self.cate_emb(pos_cates))
+            if self.use_item_sequence and self.use_neg_sequence and self.cfg_data_has_neg_cate:
+                neg_item_seq_parts.append(self.cate_emb(neg_cates))
 
         if self.use_item_sequence:
             seq_inputs.append(torch.cat(item_seq_parts, dim=-1))
             seq_masks.append(item_seq_mask)
+            if self.use_neg_sequence:
+                seq_inputs.append(torch.cat(neg_item_seq_parts, dim=-1))
+                seq_masks.append(neg_item_seq_mask)
 
         for name in self.extra_cat_names:
             nonseq_parts.append(extra_cat_embs[name])
@@ -1031,7 +1194,7 @@ class HyFormerCTR(BaseCTR):
                 ids = extra_seq_ids[:, idx, :]
                 lens = extra_seq_lens[:, idx]
                 seq_inputs.append(self._lookup_shared_seq_embedding(seq_cfg["share_embedding"], ids))
-                mask_i = torch.arange(ids.size(1), device=ids.device).unsqueeze(0) < lens.unsqueeze(1)
+                mask_i = _valid_seq_mask(ids, lens)
                 seq_masks.append(mask_i)
 
         if not seq_inputs:
@@ -1277,14 +1440,8 @@ class InterFormerCTR(BaseCTR):
         seq_fields = []
         seq_mask = None
         if self.use_item_sequence:
-            pos_mask = (
-                torch.arange(pos_items.size(1), device=pos_items.device).unsqueeze(0)
-                < pos_lens.unsqueeze(1)
-            )
-            neg_mask = (
-                torch.arange(neg_items.size(1), device=neg_items.device).unsqueeze(0)
-                < neg_lens.unsqueeze(1)
-            )
+            pos_mask = _valid_seq_mask(pos_items, pos_lens)
+            neg_mask = _valid_seq_mask(neg_items, neg_lens)
             seq_fields.append(self.item_seq_proj(pos_id_emb))
             seq_mask = pos_mask
         if self.use_item_sequence and self.use_pretrained:
@@ -1292,7 +1449,7 @@ class InterFormerCTR(BaseCTR):
         if self.use_category and self.cfg_data_has_pos_cate:
             seq_fields.append(self.cate_seq_proj(pos_cate_emb))
             if seq_mask is None:
-                seq_mask = torch.arange(pos_cates.size(1), device=pos_cates.device).unsqueeze(0) < pos_lens.unsqueeze(1)
+                seq_mask = _valid_seq_mask(pos_cates, pos_lens)
         if self.use_item_sequence and self.use_neg_sequence:
             seq_fields.append(self.item_seq_proj(neg_id_emb))
             seq_mask = seq_mask | neg_mask
@@ -1309,7 +1466,7 @@ class InterFormerCTR(BaseCTR):
                         self._lookup_shared_seq_embedding(seq_cfg["share_embedding"], ids)
                     )
                 )
-                mask_i = torch.arange(ids.size(1), device=ids.device).unsqueeze(0) < lens.unsqueeze(1)
+                mask_i = _valid_seq_mask(ids, lens)
                 seq_mask = mask_i if seq_mask is None else (seq_mask | mask_i)
 
         seq_cat = torch.cat(seq_fields, dim=-1)

@@ -4,7 +4,7 @@ includes:
 model:
   arch: "rankmixer"
   mode: "dense"
-  chunk_size: 20
+  chunk_size: 28
   hidden_dim: 1536
   num_layers: 2
   ffn_expansion: 4

@@ -345,8 +345,7 @@ class DMINCTR(nn.Module):
         B, S = seq_ids.shape
         device = seq_ids.device
 
-        pos_indices = torch.arange(S, device=device).unsqueeze(0)
-        pad_mask = pos_indices < seq_lens.unsqueeze(1)  # [B, S] True=valid
+        pad_mask = seq_ids.ne(0) & seq_lens.gt(0).unsqueeze(1)  # [B, S] True=valid
 
         # FuxiCTR attn_mask: padding + causal, 对角线保留
         padding_mask_2d = (~pad_mask).unsqueeze(1).expand(B, S, S)
@@ -361,7 +360,10 @@ class DMINCTR(nn.Module):
 
     def forward(self, user_ids, item_ids, item_vis,
                 pos_items, pos_lens, neg_items, neg_lens,
-                pos_items_vis, neg_items_vis):
+                pos_items_vis, neg_items_vis,
+                cate_ids=None, pos_cates=None, neg_cates=None,
+                extra_cat_ids=None, extra_seq_ids=None, extra_seq_lens=None,
+                numeric_vals=None):
         # Embeddings
         u_emb = self.user_emb(user_ids)          # [B, 64]
         i_emb = self.item_emb(item_ids)          # [B, 64]
