@@ -1514,6 +1514,297 @@ class InterFormerCTR(BaseCTR):
 
 
 # ============================================================
+# OneTrans CTR 模型 (ByteDance + NTU, arXiv:2510.26104)
+# Unified [S-tokens; NS-tokens] + mixed causal Transformer stack
+# ============================================================
+
+class OneTransCTR(BaseCTR):
+    """
+    OneTrans adapted to the rankmixer CTR pipeline.
+
+    Tokenization follows the paper's unified layout [S; NS]:
+    - S-tokens: per-event projections from behavior sequences (pos/neg/extra),
+      merged with learnable [SEP] tokens between sequences (timestamp-agnostic v1).
+    - NS-tokens: non-sequential user/item/context features via auto-split or
+      chunk grouping (RankMixer-style group-wise tokenizer).
+
+    BaseCTR._tokenize() (DIN + chunk) is intentionally bypassed: OneTrans performs
+    joint sequence + feature interaction inside the mixed causal stack instead of
+    compressing sequences with DIN before interaction.
+    """
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        from .onetrans import OneTransStack
+
+        data_cfg = cfg["data"]
+        emb_cfg = cfg["embedding"]
+        model_cfg = cfg["model"]
+
+        hidden_dim = self.hidden_dim
+        item_emb_dim = emb_cfg["item_emb_dim"]
+        user_emb_dim = emb_cfg["user_emb_dim"]
+        cate_emb_dim = emb_cfg.get("cate_emb_dim", item_emb_dim)
+        numeric_emb_dim = emb_cfg.get("numeric_emb_dim", item_emb_dim)
+        item_vis_dim = data_cfg.get("item_vis_dim", 0) if self.use_pretrained else 0
+        max_seq_len = data_cfg.get("max_seq_len", 100)
+
+        self._gradient_checkpointing = False
+        self.use_sep_tokens = model_cfg.get("use_sep_tokens", True)
+        self.ns_tokenizer = model_cfg.get("ns_tokenizer", "auto_split").lower()
+
+        seq_event_dims = []
+        if self.use_item_sequence:
+            event_dim = item_emb_dim
+            if self.use_pretrained:
+                event_dim += item_vis_dim
+            if self.use_category and self.cfg_data_has_pos_cate:
+                event_dim += cate_emb_dim
+            seq_event_dims.append(event_dim)
+            if self.use_neg_sequence:
+                seq_event_dims.append(event_dim)
+        for c in self.extra_seq_configs:
+            share = c["share_embedding"]
+            if share == "item_id":
+                seq_event_dims.append(item_emb_dim)
+            elif share == "cate_id":
+                seq_event_dims.append(cate_emb_dim)
+            else:
+                seq_event_dims.append(self.extra_cat_embs[share].embedding_dim)
+        if not seq_event_dims:
+            seq_event_dims.append(item_emb_dim)
+
+        self.num_sequences = len(seq_event_dims)
+        self.max_seq_len = max_seq_len
+        self.num_s_tokens = self.num_sequences * max_seq_len
+        if self.use_sep_tokens and self.num_sequences > 1:
+            self.num_s_tokens += self.num_sequences - 1
+
+        self.nonseq_dim = item_emb_dim
+        if self.use_user_feature:
+            self.nonseq_dim += user_emb_dim
+        if self.use_pretrained:
+            self.nonseq_dim += item_vis_dim
+        if self.use_category:
+            self.nonseq_dim += cate_emb_dim
+        self.nonseq_dim += sum(self.extra_cat_embs[name].embedding_dim for name in self.extra_cat_names)
+        self.nonseq_dim += len(self.numeric_cols) * numeric_emb_dim
+
+        if self.ns_tokenizer == "chunk":
+            self.num_ns_tokens = math.ceil(self.nonseq_dim / self.chunk_size)
+        else:
+            self.num_ns_tokens = model_cfg.get("num_ns_tokens", 8)
+
+        num_layers = model_cfg["num_layers"]
+        num_heads = model_cfg["num_heads"]
+        ffn_expansion = model_cfg.get("ffn_expansion", 4)
+        dropout = model_cfg.get("dropout", 0.0)
+        use_pyramid = model_cfg.get("use_pyramid", False)
+        pyramid_min_s_queries = model_cfg.get("pyramid_min_s_queries", 1)
+
+        self.seq_event_projs = nn.ModuleList([
+            nn.Linear(event_dim, hidden_dim)
+            for event_dim in seq_event_dims
+        ])
+        if self.use_sep_tokens and self.num_sequences > 1:
+            self.sep_tokens = nn.Parameter(
+                torch.zeros(self.num_sequences - 1, hidden_dim)
+            )
+            nn.init.normal_(self.sep_tokens, std=0.02)
+        else:
+            self.sep_tokens = None
+
+        if self.ns_tokenizer == "chunk":
+            self.ns_padded_dim = self.num_ns_tokens * self.chunk_size
+            self.ns_token_proj = None
+        else:
+            self.ns_padded_dim = self.nonseq_dim
+            self.ns_token_proj = nn.Sequential(
+                nn.Linear(self.nonseq_dim, hidden_dim * self.num_ns_tokens),
+                nn.GELU(),
+            )
+
+        self.stack = OneTransStack(
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            num_ns_tokens=self.num_ns_tokens,
+            ffn_expansion=ffn_expansion,
+            dropout=dropout,
+            use_pyramid=use_pyramid,
+            pyramid_min_s_queries=pyramid_min_s_queries,
+        )
+
+        output_head_units = model_cfg.get("output_head_units", [1024, 512, 256])
+        head_activation = model_cfg.get("head_activation", "Dice")
+        head_dropout = model_cfg.get("head_dropout", 0.1)
+        self.output_head = _build_output_head(
+            hidden_dim, output_head_units, head_activation, head_dropout
+        )
+
+        print(f"  [OneTrans] S tokens: {self.num_s_tokens} "
+              f"({self.num_sequences} seq x {max_seq_len}"
+              f"{', +SEP' if self.sep_tokens is not None else ''}), "
+              f"NS tokens: {self.num_ns_tokens} ({self.ns_tokenizer})")
+        print(f"  Hidden (D): {hidden_dim}, Heads: {num_heads}, Layers: {num_layers}, "
+              f"FFN expansion: {ffn_expansion}, Pyramid: {use_pyramid}, "
+              f"Dropout: {dropout}")
+
+    def enable_gradient_checkpointing(self):
+        self._gradient_checkpointing = True
+
+    def _tokenize_onetrans(
+        self,
+        user_ids,
+        item_ids,
+        item_vis,
+        pos_items,
+        pos_lens,
+        neg_items,
+        neg_lens,
+        pos_items_vis,
+        neg_items_vis,
+        cate_ids=None,
+        pos_cates=None,
+        neg_cates=None,
+        extra_cat_ids=None,
+        extra_seq_ids=None,
+        extra_seq_lens=None,
+        numeric_vals=None,
+    ):
+        u_emb = self.user_emb(user_ids) if self.use_user_feature else None
+        i_emb = self.item_emb(item_ids)
+        c_emb = self.cate_emb(cate_ids) if self.use_category else None
+        extra_cat_embs = self._extra_cat_embedding_dict(extra_cat_ids)
+
+        seq_segments = []
+        seq_masks = []
+
+        if self.use_item_sequence:
+            pos_parts = [self.item_emb(pos_items)]
+            pos_mask = _valid_seq_mask(pos_items, pos_lens)
+            if self.use_pretrained:
+                pos_parts.append(self.vis_proj(pos_items_vis))
+            if self.use_category and self.cfg_data_has_pos_cate:
+                pos_parts.append(self.cate_emb(pos_cates))
+            seq_segments.append((torch.cat(pos_parts, dim=-1), pos_mask))
+
+            if self.use_neg_sequence:
+                neg_parts = [self.item_emb(neg_items)]
+                neg_mask = _valid_seq_mask(neg_items, neg_lens)
+                if self.use_pretrained:
+                    neg_parts.append(self.vis_proj(neg_items_vis))
+                if self.use_category and self.cfg_data_has_neg_cate:
+                    neg_parts.append(self.cate_emb(neg_cates))
+                seq_segments.append((torch.cat(neg_parts, dim=-1), neg_mask))
+
+        for idx, seq_cfg in enumerate(self.extra_seq_configs):
+            ids = extra_seq_ids[:, idx, :]
+            lens = extra_seq_lens[:, idx]
+            seq_segments.append((
+                self._lookup_shared_seq_embedding(seq_cfg["share_embedding"], ids),
+                _valid_seq_mask(ids, lens),
+            ))
+
+        if not seq_segments:
+            B = item_ids.size(0)
+            seq_segments.append((
+                i_emb.new_zeros(B, 1, i_emb.size(-1)),
+                torch.ones(B, 1, dtype=torch.bool, device=item_ids.device),
+            ))
+
+        B = item_ids.size(0)
+        device = item_ids.device
+        s_tokens = []
+        s_valid = []
+        for seg_idx, (seq_raw, seq_mask) in enumerate(seq_segments):
+            proj = self.seq_event_projs[seg_idx]
+            seg_tokens = proj(seq_raw)
+            if seq_raw.size(1) < self.max_seq_len:
+                pad_len = self.max_seq_len - seq_raw.size(1)
+                seg_tokens = F.pad(seg_tokens, (0, 0, 0, pad_len))
+                seq_mask = F.pad(seq_mask, (0, pad_len), value=False)
+            elif seq_raw.size(1) > self.max_seq_len:
+                seg_tokens = seg_tokens[:, :self.max_seq_len]
+                seq_mask = seq_mask[:, :self.max_seq_len]
+            seg_tokens = seg_tokens * seq_mask.unsqueeze(-1).to(seg_tokens.dtype)
+            s_tokens.append(seg_tokens)
+            s_valid.append(seq_mask)
+            if self.sep_tokens is not None and seg_idx < len(seq_segments) - 1:
+                sep = self.sep_tokens[seg_idx].unsqueeze(0).unsqueeze(0).expand(B, 1, -1)
+                s_tokens.append(sep)
+                s_valid.append(torch.ones(B, 1, dtype=torch.bool, device=device))
+
+        s_tokens = torch.cat(s_tokens, dim=1)
+        s_valid_mask = torch.cat(s_valid, dim=1)
+
+        nonseq_parts = []
+        if self.use_user_feature:
+            nonseq_parts.append(u_emb)
+        nonseq_parts.append(i_emb)
+        if self.use_pretrained:
+            nonseq_parts.append(self.vis_proj(item_vis))
+        if self.use_category:
+            nonseq_parts.append(c_emb)
+        nonseq_parts.extend(extra_cat_embs[name] for name in self.extra_cat_names)
+        for idx, name in enumerate(self.numeric_cols):
+            nonseq_parts.append(self.numeric_projs[name](numeric_vals[:, idx:idx + 1]))
+        nonseq_input = torch.cat(nonseq_parts, dim=-1)
+
+        if self.ns_tokenizer == "chunk":
+            if nonseq_input.size(-1) < self.ns_padded_dim:
+                nonseq_input = F.pad(nonseq_input, (0, self.ns_padded_dim - nonseq_input.size(-1)))
+            ns_chunks = nonseq_input.view(B, self.num_ns_tokens, self.chunk_size)
+            ns_tokens = self.proj(ns_chunks)
+        else:
+            if nonseq_input.size(-1) < self.nonseq_dim:
+                nonseq_input = F.pad(nonseq_input, (0, self.nonseq_dim - nonseq_input.size(-1)))
+            ns_tokens = self.ns_token_proj(nonseq_input).view(B, self.num_ns_tokens, self.hidden_dim)
+
+        x = torch.cat([s_tokens, ns_tokens], dim=1)
+        return x, s_valid_mask, u_emb, i_emb
+
+    def forward(
+        self,
+        user_ids,
+        item_ids,
+        item_vis,
+        pos_items,
+        pos_lens,
+        neg_items,
+        neg_lens,
+        pos_items_vis,
+        neg_items_vis,
+        cate_ids=None,
+        pos_cates=None,
+        neg_cates=None,
+        extra_cat_ids=None,
+        extra_seq_ids=None,
+        extra_seq_lens=None,
+        numeric_vals=None,
+    ):
+        x, s_valid_mask, u_emb, i_emb = self._tokenize_onetrans(
+            user_ids, item_ids, item_vis,
+            pos_items, pos_lens, neg_items, neg_lens,
+            pos_items_vis, neg_items_vis,
+            cate_ids, pos_cates, neg_cates,
+            extra_cat_ids, extra_seq_ids, extra_seq_lens,
+            numeric_vals,
+        )
+
+        num_s = x.size(1) - self.num_ns_tokens
+        if self._gradient_checkpointing and self.training:
+            x = ckpt_fn(self.stack, x, num_s, s_valid_mask, use_reentrant=False)
+        else:
+            x = self.stack(x, num_s, s_valid_mask)
+
+        ns_repr = x[:, -self.num_ns_tokens:].mean(dim=1)
+        logits = self.output_head(ns_repr).squeeze(-1)
+        reg_loss = self._get_embedding_reg_loss(u_emb, i_emb)
+        return logits, reg_loss
+
+
+# ============================================================
 # 构建模型 (统一入口)
 # ============================================================
 
@@ -1534,5 +1825,7 @@ def build_model(cfg) -> nn.Module:
     elif arch == "dmin":
         from .dmin import DMINCTR
         return DMINCTR(cfg)
+    elif arch == "onetrans":
+        return OneTransCTR(cfg)
     else:
         return RankMixerCTR(cfg)

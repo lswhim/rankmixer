@@ -1,0 +1,41 @@
+includes:
+  - ../data/datasets/kuaivideo.yaml
+
+model:
+  arch: "onetrans"
+  chunk_size: 28
+  hidden_dim: 256
+  num_layers: 2
+  num_heads: 4
+  ffn_expansion: 4
+  dropout: 0.0
+  num_ns_tokens: 8
+  ns_tokenizer: "auto_split"
+  use_sep_tokens: true
+  use_pyramid: false
+  pyramid_min_s_queries: 1
+  din_hidden_units: [512, 256]
+  output_head_units: [1024, 512, 256]
+  head_activation: "Dice"
+  head_dropout: 0.1
+training:
+  batch_size: 512
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  num_epochs: 100
+  grad_clip_norm: 10.0
+  optimizer: "adam"
+  monitor: {"gAUC": 1, "AUC": 1}
+  reduce_lr_on_plateau: true
+  lr_decay_factor: 0.1
+  scheduler_eta_min: 1.0e-6
+  early_stop_patience: 2
+logging:
+  log_interval: 200
+  eval_samples: 0
+  save_best: true
+seed: 20222023
+device: "auto"
+wandb:
+  project: "rankmixer"
+  tags: ["onetrans", "kuaivideo", "bars_aligned"]
