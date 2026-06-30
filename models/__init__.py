@@ -42,6 +42,7 @@ from .hyformer import (
 
 from .onetrans import (
     RMSNorm as OneTransRMSNorm,
+    TokenLayout,
     MixedLinear,
     MixedFFN,
     MixedCausalAttention,

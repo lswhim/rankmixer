@@ -1576,9 +1576,9 @@ class OneTransCTR(BaseCTR):
 
         self.num_sequences = len(seq_event_dims)
         self.max_seq_len = max_seq_len
-        self.num_s_tokens = self.num_sequences * max_seq_len
+        self.num_sequence_tokens = self.num_sequences * max_seq_len
         if self.use_sep_tokens and self.num_sequences > 1:
-            self.num_s_tokens += self.num_sequences - 1
+            self.num_sequence_tokens += self.num_sequences - 1
 
         self.nonseq_dim = item_emb_dim
         if self.use_user_feature:
@@ -1591,9 +1591,9 @@ class OneTransCTR(BaseCTR):
         self.nonseq_dim += len(self.numeric_cols) * numeric_emb_dim
 
         if self.ns_tokenizer == "chunk":
-            self.num_ns_tokens = math.ceil(self.nonseq_dim / self.chunk_size)
+            self.num_non_sequence_tokens = math.ceil(self.nonseq_dim / self.chunk_size)
         else:
-            self.num_ns_tokens = model_cfg.get("num_ns_tokens", 8)
+            self.num_non_sequence_tokens = model_cfg.get("num_ns_tokens", 8)
 
         num_layers = model_cfg["num_layers"]
         num_heads = model_cfg["num_heads"]
@@ -1615,12 +1615,12 @@ class OneTransCTR(BaseCTR):
             self.sep_tokens = None
 
         if self.ns_tokenizer == "chunk":
-            self.ns_padded_dim = self.num_ns_tokens * self.chunk_size
+            self.ns_padded_dim = self.num_non_sequence_tokens * self.chunk_size
             self.ns_token_proj = None
         else:
             self.ns_padded_dim = self.nonseq_dim
             self.ns_token_proj = nn.Sequential(
-                nn.Linear(self.nonseq_dim, hidden_dim * self.num_ns_tokens),
+                nn.Linear(self.nonseq_dim, hidden_dim * self.num_non_sequence_tokens),
                 nn.GELU(),
             )
 
@@ -1628,7 +1628,7 @@ class OneTransCTR(BaseCTR):
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             num_heads=num_heads,
-            num_ns_tokens=self.num_ns_tokens,
+            num_non_sequence_tokens=self.num_non_sequence_tokens,
             ffn_expansion=ffn_expansion,
             dropout=dropout,
             use_pyramid=use_pyramid,
@@ -1642,10 +1642,10 @@ class OneTransCTR(BaseCTR):
             hidden_dim, output_head_units, head_activation, head_dropout
         )
 
-        print(f"  [OneTrans] S tokens: {self.num_s_tokens} "
+        print(f"  [OneTrans] sequence tokens: {self.num_sequence_tokens} "
               f"({self.num_sequences} seq x {max_seq_len}"
               f"{', +SEP' if self.sep_tokens is not None else ''}), "
-              f"NS tokens: {self.num_ns_tokens} ({self.ns_tokenizer})")
+              f"non-sequence tokens: {self.num_non_sequence_tokens} ({self.ns_tokenizer})")
         print(f"  Hidden (D): {hidden_dim}, Heads: {num_heads}, Layers: {num_layers}, "
               f"FFN expansion: {ffn_expansion}, Pyramid: {use_pyramid}, "
               f"Dropout: {dropout}")
@@ -1754,13 +1754,18 @@ class OneTransCTR(BaseCTR):
         if self.ns_tokenizer == "chunk":
             if nonseq_input.size(-1) < self.ns_padded_dim:
                 nonseq_input = F.pad(nonseq_input, (0, self.ns_padded_dim - nonseq_input.size(-1)))
-            ns_chunks = nonseq_input.view(B, self.num_ns_tokens, self.chunk_size)
+            ns_chunks = nonseq_input.view(B, self.num_non_sequence_tokens, self.chunk_size)
             ns_tokens = self.proj(ns_chunks)
         else:
             if nonseq_input.size(-1) < self.nonseq_dim:
                 nonseq_input = F.pad(nonseq_input, (0, self.nonseq_dim - nonseq_input.size(-1)))
-            ns_tokens = self.ns_token_proj(nonseq_input).view(B, self.num_ns_tokens, self.hidden_dim)
+            ns_tokens = self.ns_token_proj(nonseq_input).view(
+                B, self.num_non_sequence_tokens, self.hidden_dim
+            )
 
+        # Unified token layout for OneTransStack (causal left → right):
+        #   [ S₁ … Sₙ | NS₁ … NSₘ ]
+        #     sequence    features (each NS slot has its own QKV/FFN)
         x = torch.cat([s_tokens, ns_tokens], dim=1)
         return x, s_valid_mask, u_emb, i_emb
 
@@ -1792,13 +1797,13 @@ class OneTransCTR(BaseCTR):
             numeric_vals,
         )
 
-        num_s = x.size(1) - self.num_ns_tokens
+        num_sequence_tokens = x.size(1) - self.num_non_sequence_tokens
         if self._gradient_checkpointing and self.training:
-            x = ckpt_fn(self.stack, x, num_s, s_valid_mask, use_reentrant=False)
+            x = ckpt_fn(self.stack, x, num_sequence_tokens, s_valid_mask, use_reentrant=False)
         else:
-            x = self.stack(x, num_s, s_valid_mask)
+            x = self.stack(x, num_sequence_tokens, s_valid_mask)
 
-        ns_repr = x[:, -self.num_ns_tokens:].mean(dim=1)
+        ns_repr = x[:, -self.num_non_sequence_tokens:].mean(dim=1)
         logits = self.output_head(ns_repr).squeeze(-1)
         reg_loss = self._get_embedding_reg_loss(u_emb, i_emb)
         return logits, reg_loss

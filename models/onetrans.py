@@ -15,11 +15,37 @@ Not implemented in this module (CTR wrapper / serving stubs):
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+@dataclass(frozen=True)
+class TokenLayout:
+    """
+    OneTrans unified token sequence layout:
+
+        [ S₁  S₂  …  Sₙ  |  NS₁  NS₂  …  NSₘ ]
+        └─ sequence ────┘  └── non-sequence ──┘
+
+    S-tokens (sequence): shared Q/K/V and FFN weights across all positions.
+    NS-tokens (non-sequence): each position has its own Q/K/V and FFN weights.
+    """
+
+    num_sequence_tokens: int
+    num_non_sequence_tokens: int
+
+    @property
+    def total_tokens(self) -> int:
+        return self.num_sequence_tokens + self.num_non_sequence_tokens
+
+    def split(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split [B, S+NS, D] into sequence and non-sequence segments."""
+        n_seq = self.num_sequence_tokens
+        return x[:, :n_seq], x[:, n_seq:]
 
 
 class RMSNorm(nn.Module):
@@ -35,82 +61,121 @@ class RMSNorm(nn.Module):
 
 class MixedLinear(nn.Module):
     """
-    Mixed linear map from Eqn. (11)-(12):
-    S-tokens (index < num_s) share one weight; each NS-token has its own weight.
+    Mixed linear projection (OneTrans Eqn. 11–12).
+
+    QKV strategy:
+    - **S-tokens** (sequence): one shared ``Linear(dim, dim)`` for every position.
+    - **NS-tokens** (non-sequence): position ``i`` uses its own weight ``ns_weight[i]``.
+
+    Call ``forward_split(seq_tokens, ns_tokens)`` when S/NS segments are already
+    separated; ``forward(x, num_sequence_tokens)`` splits a concatenated tensor.
     """
 
-    def __init__(self, dim: int, num_ns_tokens: int, bias: bool = True):
+    def __init__(self, dim: int, num_non_sequence_tokens: int, bias: bool = True):
         super().__init__()
         self.dim = dim
-        self.num_ns = num_ns_tokens
+        self.num_non_sequence_tokens = num_non_sequence_tokens
+        # Shared by all sequence tokens (S₁…Sₙ).
         self.shared = nn.Linear(dim, dim, bias=bias)
-        self.ns_weight = nn.Parameter(torch.empty(num_ns_tokens, dim, dim))
+        # One weight matrix per non-sequence token (NS₁…NSₘ).
+        self.ns_weight = nn.Parameter(
+            torch.empty(num_non_sequence_tokens, dim, dim)
+        )
         if bias:
-            self.ns_bias = nn.Parameter(torch.zeros(num_ns_tokens, dim))
+            self.ns_bias = nn.Parameter(torch.zeros(num_non_sequence_tokens, dim))
         else:
             self.register_parameter("ns_bias", None)
         nn.init.xavier_uniform_(self.ns_weight)
         if self.ns_bias is not None:
             nn.init.zeros_(self.ns_bias)
 
-    def forward(self, x: torch.Tensor, num_s: int) -> torch.Tensor:
-        s_part = self.shared(x[:, :num_s])
-        if self.num_ns == 0:
-            return s_part
-        ns_part = x[:, num_s:]
-        ns_out = torch.einsum("bnd, ndo -> bno", ns_part, self.ns_weight)
+    def forward_split(
+        self,
+        seq_tokens: torch.Tensor,
+        ns_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        # S: shared W, b  →  y_s = x_s @ W^T + b
+        seq_out = self.shared(seq_tokens)
+        if self.num_non_sequence_tokens == 0:
+            return seq_out
+        # NS: per-token W_i, b_i  →  y_ns[i] = x_ns[i] @ W_i^T + b_i
+        ns_out = torch.einsum("bnd, ndo -> bno", ns_tokens, self.ns_weight)
         if self.ns_bias is not None:
             ns_out = ns_out + self.ns_bias.unsqueeze(0)
-        return torch.cat([s_part, ns_out], dim=1)
+        return torch.cat([seq_out, ns_out], dim=1)
+
+    def forward(self, x: torch.Tensor, num_sequence_tokens: int) -> torch.Tensor:
+        seq_tokens, ns_tokens = x[:, :num_sequence_tokens], x[:, num_sequence_tokens:]
+        return self.forward_split(seq_tokens, ns_tokens)
 
 
 class MixedFFN(nn.Module):
-    """Mixed feed-forward: one shared FFN for S-tokens, per-token FFN for NS-tokens."""
+    """
+    Mixed feed-forward network: shared FFN for S-tokens, per-token FFN for NS-tokens.
+    """
 
     def __init__(
         self,
         hidden_dim: int,
-        num_ns_tokens: int,
+        num_non_sequence_tokens: int,
         expansion: int = 4,
         dropout: float = 0.0,
     ):
         super().__init__()
         inner_dim = hidden_dim * expansion
-        self.num_ns = num_ns_tokens
+        self.num_non_sequence_tokens = num_non_sequence_tokens
+        # Shared two-layer FFN for all sequence tokens.
         self.s_ffn = nn.Sequential(
             nn.Linear(hidden_dim, inner_dim),
             nn.GELU(),
             nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
             nn.Linear(inner_dim, hidden_dim),
         )
-        if num_ns_tokens > 0:
-            self.ns_w1 = nn.Parameter(torch.empty(num_ns_tokens, hidden_dim, inner_dim))
-            self.ns_b1 = nn.Parameter(torch.zeros(num_ns_tokens, inner_dim))
-            self.ns_w2 = nn.Parameter(torch.empty(num_ns_tokens, inner_dim, hidden_dim))
-            self.ns_b2 = nn.Parameter(torch.zeros(num_ns_tokens, hidden_dim))
-            for t in range(num_ns_tokens):
+        if num_non_sequence_tokens > 0:
+            # Per NS-token FFN weights.
+            self.ns_w1 = nn.Parameter(
+                torch.empty(num_non_sequence_tokens, hidden_dim, inner_dim)
+            )
+            self.ns_b1 = nn.Parameter(torch.zeros(num_non_sequence_tokens, inner_dim))
+            self.ns_w2 = nn.Parameter(
+                torch.empty(num_non_sequence_tokens, inner_dim, hidden_dim)
+            )
+            self.ns_b2 = nn.Parameter(torch.zeros(num_non_sequence_tokens, hidden_dim))
+            for t in range(num_non_sequence_tokens):
                 nn.init.kaiming_uniform_(self.ns_w1[t], a=math.sqrt(5))
                 nn.init.kaiming_uniform_(self.ns_w2[t], a=math.sqrt(5))
 
-    def forward(self, x: torch.Tensor, num_s: int) -> torch.Tensor:
-        s_out = self.s_ffn(x[:, :num_s])
-        if self.num_ns == 0:
-            return s_out
-        ns = x[:, num_s:]
-        h = torch.einsum("bnd, ndi -> bni", ns, self.ns_w1) + self.ns_b1.unsqueeze(0)
+    def forward_split(
+        self,
+        seq_tokens: torch.Tensor,
+        ns_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        seq_out = self.s_ffn(seq_tokens)
+        if self.num_non_sequence_tokens == 0:
+            return seq_out
+        h = torch.einsum("bnd, ndi -> bni", ns_tokens, self.ns_w1) + self.ns_b1.unsqueeze(0)
         h = F.gelu(h)
         ns_out = torch.einsum("bni, nio -> bno", h, self.ns_w2) + self.ns_b2.unsqueeze(0)
-        return torch.cat([s_out, ns_out], dim=1)
+        return torch.cat([seq_out, ns_out], dim=1)
+
+    def forward(self, x: torch.Tensor, num_sequence_tokens: int) -> torch.Tensor:
+        seq_tokens, ns_tokens = x[:, :num_sequence_tokens], x[:, num_sequence_tokens:]
+        return self.forward_split(seq_tokens, ns_tokens)
 
 
 class MixedCausalAttention(nn.Module):
-    """Standard causal MHA with mixed Q/K/V/out projections (paper Sec. 3.3.1)."""
+    """
+    Causal multi-head attention with mixed Q/K/V/out projections (paper Sec. 3.3.1).
+
+    QKV layout mirrors ``MixedLinear``: S-tokens share projections; each NS-token
+    has dedicated Q, K, V, and output projections.
+    """
 
     def __init__(
         self,
         hidden_dim: int,
         num_heads: int,
-        num_ns_tokens: int,
+        num_non_sequence_tokens: int,
         dropout: float = 0.0,
     ):
         super().__init__()
@@ -121,13 +186,13 @@ class MixedCausalAttention(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-        self.num_ns = num_ns_tokens
+        self.num_non_sequence_tokens = num_non_sequence_tokens
         self.scale = self.head_dim ** -0.5
 
-        self.q_proj = MixedLinear(hidden_dim, num_ns_tokens, bias=True)
-        self.k_proj = MixedLinear(hidden_dim, num_ns_tokens, bias=True)
-        self.v_proj = MixedLinear(hidden_dim, num_ns_tokens, bias=True)
-        self.out_proj = MixedLinear(hidden_dim, num_ns_tokens, bias=True)
+        self.q_proj = MixedLinear(hidden_dim, num_non_sequence_tokens, bias=True)
+        self.k_proj = MixedLinear(hidden_dim, num_non_sequence_tokens, bias=True)
+        self.v_proj = MixedLinear(hidden_dim, num_non_sequence_tokens, bias=True)
+        self.out_proj = MixedLinear(hidden_dim, num_non_sequence_tokens, bias=True)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
@@ -141,14 +206,18 @@ class MixedCausalAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        num_s: int,
+        num_sequence_tokens: int,
         attn_mask: torch.Tensor,
         query_indices: Optional[torch.Tensor] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        q_full = self._split_heads(self.q_proj(x, num_s))
-        k_full = self._split_heads(self.k_proj(x, num_s))
-        v_full = self._split_heads(self.v_proj(x, num_s))
+        # Explicit S | NS split before mixed QKV projection.
+        layout = TokenLayout(num_sequence_tokens, self.num_non_sequence_tokens)
+        seq_tokens, ns_tokens = layout.split(x)
+
+        q_full = self._split_heads(self.q_proj.forward_split(seq_tokens, ns_tokens))
+        k_full = self._split_heads(self.k_proj.forward_split(seq_tokens, ns_tokens))
+        v_full = self._split_heads(self.v_proj.forward_split(seq_tokens, ns_tokens))
 
         if query_indices is None:
             q = q_full
@@ -178,8 +247,16 @@ class MixedCausalAttention(nn.Module):
 
         out = torch.matmul(attn_probs, v_full)
         out = self._merge_heads(out)
-        num_s_out = num_s if query_indices is None else int((query_indices < num_s).sum().item())
-        return self.out_proj(out, num_s_out)
+
+        if query_indices is None:
+            num_seq_in_out = num_sequence_tokens
+            seq_out, ns_out = out[:, :num_sequence_tokens], out[:, num_sequence_tokens:]
+        else:
+            num_seq_in_out = int((query_indices < num_sequence_tokens).sum().item())
+            seq_out = out[:, :num_seq_in_out]
+            ns_out = out[:, num_seq_in_out:]
+
+        return self.out_proj.forward_split(seq_out, ns_out)
 
 
 class OneTransBlock(nn.Module):
@@ -193,7 +270,7 @@ class OneTransBlock(nn.Module):
         self,
         hidden_dim: int,
         num_heads: int,
-        num_ns_tokens: int,
+        num_non_sequence_tokens: int,
         ffn_expansion: int = 4,
         dropout: float = 0.0,
     ):
@@ -201,16 +278,16 @@ class OneTransBlock(nn.Module):
         self.attn_norm = RMSNorm(hidden_dim)
         self.ffn_norm = RMSNorm(hidden_dim)
         self.attn = MixedCausalAttention(
-            hidden_dim, num_heads, num_ns_tokens, dropout=dropout
+            hidden_dim, num_heads, num_non_sequence_tokens, dropout=dropout
         )
         self.ffn = MixedFFN(
-            hidden_dim, num_ns_tokens, expansion=ffn_expansion, dropout=dropout
+            hidden_dim, num_non_sequence_tokens, expansion=ffn_expansion, dropout=dropout
         )
 
     def forward(
         self,
         x: torch.Tensor,
-        num_s: int,
+        num_sequence_tokens: int,
         attn_mask: torch.Tensor,
         query_indices: Optional[torch.Tensor] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
@@ -221,42 +298,50 @@ class OneTransBlock(nn.Module):
 
         h = self.attn(
             self.attn_norm(x),
-            num_s=num_s,
+            num_sequence_tokens=num_sequence_tokens,
             attn_mask=attn_mask,
             query_indices=query_indices,
             key_padding_mask=key_padding_mask,
         )
         z = residual + h
 
-        num_s_out = num_s
+        num_seq_after_attn = num_sequence_tokens
         if query_indices is not None:
-            num_s_out = int((query_indices < num_s).sum().item())
+            num_seq_after_attn = int((query_indices < num_sequence_tokens).sum().item())
 
-        out = z + self.ffn(self.ffn_norm(z), num_s_out)
-        return out, num_s_out
+        out = z + self.ffn(self.ffn_norm(z), num_seq_after_attn)
+        return out, num_seq_after_attn
 
 
 def build_pyramid_query_indices(
     layer_idx: int,
     num_layers: int,
-    initial_num_s: int,
-    current_num_s: int,
-    num_ns: int,
-    min_s_queries: int,
+    initial_num_sequence_tokens: int,
+    current_num_sequence_tokens: int,
+    num_non_sequence_tokens: int,
+    min_sequence_queries: int,
 ) -> torch.Tensor:
     """
     Pyramid schedule (paper Sec. 3.4): keep the tail of S-tokens as queries;
     NS-tokens always remain in the query set.
     """
     if num_layers <= 1:
-        s_queries = current_num_s
+        seq_queries = current_num_sequence_tokens
     else:
         keep_ratio = 1.0 - (layer_idx + 1) / num_layers
-        s_queries = max(min_s_queries, int(math.ceil(initial_num_s * keep_ratio)))
-        s_queries = min(s_queries, current_num_s)
-    s_idx = torch.arange(current_num_s - s_queries, current_num_s)
-    ns_idx = torch.arange(current_num_s, current_num_s + num_ns)
-    return torch.cat([s_idx, ns_idx])
+        seq_queries = max(
+            min_sequence_queries,
+            int(math.ceil(initial_num_sequence_tokens * keep_ratio)),
+        )
+        seq_queries = min(seq_queries, current_num_sequence_tokens)
+    seq_idx = torch.arange(
+        current_num_sequence_tokens - seq_queries, current_num_sequence_tokens
+    )
+    ns_idx = torch.arange(
+        current_num_sequence_tokens,
+        current_num_sequence_tokens + num_non_sequence_tokens,
+    )
+    return torch.cat([seq_idx, ns_idx])
 
 
 class OneTransStack(nn.Module):
@@ -267,7 +352,7 @@ class OneTransStack(nn.Module):
         hidden_dim: int,
         num_layers: int,
         num_heads: int,
-        num_ns_tokens: int,
+        num_non_sequence_tokens: int,
         ffn_expansion: int = 4,
         dropout: float = 0.0,
         use_pyramid: bool = False,
@@ -275,14 +360,14 @@ class OneTransStack(nn.Module):
     ):
         super().__init__()
         self.num_layers = num_layers
-        self.num_ns = num_ns_tokens
+        self.num_non_sequence_tokens = num_non_sequence_tokens
         self.use_pyramid = use_pyramid
         self.pyramid_min_s_queries = pyramid_min_s_queries
         self.blocks = nn.ModuleList([
             OneTransBlock(
                 hidden_dim,
                 num_heads,
-                num_ns_tokens,
+                num_non_sequence_tokens,
                 ffn_expansion=ffn_expansion,
                 dropout=dropout,
             )
@@ -292,12 +377,12 @@ class OneTransStack(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        num_s: int,
-        s_valid_mask: torch.Tensor,
+        num_sequence_tokens: int,
+        seq_valid_mask: torch.Tensor,
     ) -> torch.Tensor:
-        num_ns = self.num_ns
+        num_ns = self.num_non_sequence_tokens
         key_padding_mask = torch.cat([
-            ~s_valid_mask,
+            ~seq_valid_mask,
             torch.zeros(
                 x.size(0), num_ns, dtype=torch.bool, device=x.device
             ),
@@ -308,7 +393,7 @@ class OneTransStack(nn.Module):
             key_padding_mask = key_padding_mask.clone()
             key_padding_mask[all_padding, 0] = False
 
-        initial_num_s = num_s
+        initial_num_sequence_tokens = num_sequence_tokens
         attn_mask = None
         for layer_idx, block in enumerate(self.blocks):
             query_indices = None
@@ -316,15 +401,15 @@ class OneTransStack(nn.Module):
                 query_indices = build_pyramid_query_indices(
                     layer_idx,
                     self.num_layers,
-                    initial_num_s,
-                    num_s,
+                    initial_num_sequence_tokens,
+                    num_sequence_tokens,
                     num_ns,
                     self.pyramid_min_s_queries,
                 ).to(x.device)
 
-            x, num_s = block(
+            x, num_sequence_tokens = block(
                 x,
-                num_s=num_s,
+                num_sequence_tokens=num_sequence_tokens,
                 attn_mask=attn_mask,
                 query_indices=query_indices,
                 key_padding_mask=key_padding_mask,
